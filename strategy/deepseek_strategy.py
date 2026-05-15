@@ -127,7 +127,7 @@ class DeepSeekAIStrategy(Strategy):
     DeepSeek AI-powered trading strategy.
 
     Combines AI decision making, technical analysis, and sentiment data
-    for intelligent cryptocurrency trading on Binance Futures.
+    for intelligent cryptocurrency trading on perpetual futures.
     """
 
     def __init__(self, config: DeepSeekAIStrategyConfig):
@@ -347,8 +347,11 @@ class DeepSeekAIStrategy(Strategy):
         self.instrument: Optional[Instrument] = None
         self.last_signal: Optional[Dict[str, Any]] = None
         self.bars_received = 0
+        self.dry_run = os.getenv("DRY_RUN", "false").strip().lower() == "true"
 
         self.log.info(f"DeepSeek AI Strategy initialized for {self.instrument_id}")
+        if self.dry_run:
+            self.log.warning("⚠️ DRY_RUN=true: Orders will be simulated and NOT submitted to exchange")
 
     def on_start(self):
         """Actions to be performed on strategy start."""
@@ -418,10 +421,10 @@ class DeepSeekAIStrategy(Strategy):
 
     def _prefetch_historical_bars(self, limit: int = 200):
         """
-        Pre-fetch historical bars from Binance API on startup.
+        Pre-fetch historical bars from exchange REST API on startup.
 
         This eliminates the waiting period for indicators to initialize by loading
-        historical data directly from Binance exchange on strategy startup.
+        historical data directly from the exchange on strategy startup.
 
         Parameters
         ----------
@@ -437,7 +440,7 @@ class DeepSeekAIStrategy(Strategy):
             symbol_str = str(self.instrument_id)
             symbol = symbol_str.split('-')[0]
 
-            # Convert bar type to Binance interval
+            # Convert bar type to venue interval
             bar_type_str = str(self.bar_type)
             if '1-MINUTE' in bar_type_str:
                 interval = '1m'
@@ -455,27 +458,63 @@ class DeepSeekAIStrategy(Strategy):
                 interval = '5m'  # Default fallback
 
             self.log.info(
-                f"📡 Pre-fetching {limit} historical bars from Binance "
+                f"📡 Pre-fetching {limit} historical bars "
                 f"(symbol={symbol}, interval={interval})..."
             )
 
-            # Binance Futures API endpoint
-            url = "https://fapi.binance.com/fapi/v1/klines"
-            params = {
-                'symbol': symbol,
-                'interval': interval,
-                'limit': min(limit, 1500),  # Binance max
-            }
+            venue = str(self.instrument_id).split(".")[-1]
+            klines = []
 
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            klines = response.json()
+            if venue == "BYBIT":
+                # Bybit V5 kline API (linear for USDT perpetuals)
+                bybit_interval_map = {
+                    "1m": "1",
+                    "5m": "5",
+                    "15m": "15",
+                    "1h": "60",
+                    "4h": "240",
+                    "1d": "D",
+                }
+                bybit_interval = bybit_interval_map.get(interval, "5")
+                url = "https://api.bybit.com/v5/market/kline"
+                params = {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "interval": bybit_interval,
+                    "limit": min(limit, 1000),  # Bybit max
+                }
+                response = requests.get(url, params=params, timeout=10)
+                response.raise_for_status()
+                payload = response.json()
+                rows = (payload.get("result") or {}).get("list") or []
+                # API returns newest first; strategy warmup needs chronological order
+                rows = sorted(rows, key=lambda r: int(r[0]))
+                for row in rows:
+                    klines.append([
+                        int(row[0]),  # open_time_ms
+                        row[1],       # open
+                        row[2],       # high
+                        row[3],       # low
+                        row[4],       # close
+                        row[5],       # volume
+                    ])
+            else:
+                # Binance fallback for legacy instruments
+                url = "https://fapi.binance.com/fapi/v1/klines"
+                params = {
+                    'symbol': symbol,
+                    'interval': interval,
+                    'limit': min(limit, 1500),  # Binance max
+                }
+                response = requests.get(url, params=params, timeout=10)
+                response.raise_for_status()
+                klines = response.json()
 
             if not klines:
-                self.log.warning("⚠️ No bars received from Binance API")
+                self.log.warning("⚠️ No bars received from exchange API")
                 return
 
-            self.log.info(f"📊 Received {len(klines)} bars from Binance")
+            self.log.info(f"📊 Received {len(klines)} warmup bars from {venue}")
 
             # Convert to NautilusTrader bars and feed to indicators
             bars_fed = 0
@@ -507,8 +546,12 @@ class DeepSeekAIStrategy(Strategy):
             )
 
         except Exception as e:
-            self.log.error(f"❌ Failed to pre-fetch bars from Binance: {e}")
+            self.log.error(f"❌ Failed to pre-fetch bars from exchange: {e}")
             self.log.warning("Continuing with live bars only...")
+
+    def _is_dry_run(self) -> bool:
+        """Return whether strategy should simulate execution only."""
+        return self.dry_run
 
     def on_bar(self, bar: Bar):
         """
@@ -970,6 +1013,13 @@ class DeepSeekAIStrategy(Strategy):
         reduce_only: bool = False,
     ):
         """Submit market order to exchange."""
+        if self._is_dry_run():
+            self.log.info(
+                f"🧪 DRY RUN: Simulated {side.name} market order {quantity:.3f} BTC "
+                f"(reduce_only={reduce_only})"
+            )
+            return
+
         if quantity < self.position_config['min_trade_amount']:
             self.log.warning(
                 f"⚠️ Order quantity {quantity:.3f} below minimum "
@@ -1020,6 +1070,13 @@ class DeepSeekAIStrategy(Strategy):
             self.log.warning(
                 f"⚠️ Order quantity {quantity:.3f} below minimum "
                 f"{self.position_config['min_trade_amount']:.3f}, skipping"
+            )
+            return
+
+        if self._is_dry_run():
+            self.log.info(
+                f"🧪 DRY RUN: Simulated bracket order {side.name} {quantity:.3f} BTC "
+                f"(entry + SL + TP not submitted)"
             )
             return
 

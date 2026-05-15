@@ -2,10 +2,10 @@
 
 strategy:
   name: "DeepSeekAIStrategy"
-  instrument_id: "BTCUSDT-PERP.BINANCE"
+  instrument_id: "BTCUSDT-LINEAR.BYBIT"
 
   # Bar configuration
-  bar_type: "BTCUSDT-PERP.BINANCE-15-MINUTE-LAST-EXTERNAL"  # Production: 15-minute bars
+  bar_type: "BTCUSDT-LINEAR.BYBIT-15-MINUTE-LAST-EXTERNAL"  # Production: 15-minute bars
 
   # Capital and leverage
   equity: 400  # USDT (实际账户余额)

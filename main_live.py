@@ -1,7 +1,7 @@
 """
 Live Trading Entrypoint for DeepSeek AI Strategy
 
-Runs the DeepSeek AI strategy on Binance Futures (BTCUSDT-PERP) with live market data.
+Runs the DeepSeek AI strategy on Bybit linear perpetuals with live market data.
 """
 
 import os
@@ -12,9 +12,16 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
-from nautilus_trader.adapters.binance.config import BinanceDataClientConfig, BinanceExecClientConfig
-from nautilus_trader.adapters.binance.factories import BinanceLiveDataClientFactory, BinanceLiveExecClientFactory
+from nautilus_trader.adapters.bybit import BYBIT
+from nautilus_trader.adapters.bybit import BybitLiveDataClientFactory
+from nautilus_trader.adapters.bybit import BybitLiveExecClientFactory
+from nautilus_trader.adapters.bybit import BybitProductType
+from nautilus_trader.adapters.bybit.config import BybitDataClientConfig, BybitExecClientConfig
+try:
+    # Newer Nautilus versions
+    from nautilus_trader.adapters.bybit import BybitEnvironment
+except Exception:  # pragma: no cover - compatibility across Nautilus versions
+    BybitEnvironment = None
 from nautilus_trader.config import InstrumentProviderConfig, LiveExecEngineConfig, LoggingConfig, TradingNodeConfig
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.identifiers import TraderId, InstrumentId
@@ -104,6 +111,10 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
     leverage = get_env_float('LEVERAGE', str(strategy_yaml.get('leverage', '10')))
     base_position = get_env_float('BASE_POSITION_USDT', str(strategy_yaml.get('position_management', {}).get('base_usdt_amount', '30')))
     timeframe = get_env_str('TIMEFRAME', '15m')  # Production: 15-minute timeframe
+    instrument_id = get_env_str(
+        'INSTRUMENT_ID',
+        str(strategy_yaml.get('instrument_id', 'BTCUSDT-LINEAR.BYBIT')),
+    )
     
     # Debug output
     print(f"[CONFIG] Equity: {equity}")
@@ -134,11 +145,11 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         bar_spec = '15-MINUTE-LAST'  # Default
     
     print(f"DEBUG: bar_spec = '{bar_spec}'")  # Debug
-    final_bar_type = f"BTCUSDT-PERP.BINANCE-{bar_spec}-EXTERNAL"
+    final_bar_type = f"{instrument_id}-{bar_spec}-EXTERNAL"
     print(f"DEBUG: final_bar_type = '{final_bar_type}'")  # Debug
 
     return DeepSeekAIStrategyConfig(
-        instrument_id="BTCUSDT-PERP.BINANCE",
+        instrument_id=instrument_id,
         bar_type=final_bar_type,
 
         # Capital
@@ -152,7 +163,7 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         low_confidence_multiplier=get_env_float('LOW_CONFIDENCE_MULTIPLIER', '0.5'),
         max_position_ratio=get_env_float('MAX_POSITION_RATIO', '0.10'),
         trend_strength_multiplier=get_env_float('TREND_STRENGTH_MULTIPLIER', '1.2'),
-        min_trade_amount=0.001,  # Binance minimum
+        min_trade_amount=0.001,
 
         # Technical indicators - Production mode (standard periods)
         # Use reduced periods only for 1m bars (for testing)
@@ -200,9 +211,9 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
     )
 
 
-def get_binance_config() -> tuple:
+def get_bybit_config() -> tuple:
     """
-    Build Binance data and execution client configs.
+    Build Bybit data and execution client configs.
 
     Returns
     -------
@@ -210,29 +221,39 @@ def get_binance_config() -> tuple:
         (data_config, exec_config)
     """
     # Get API credentials
-    api_key = os.getenv('BINANCE_API_KEY')
-    api_secret = os.getenv('BINANCE_API_SECRET')
+    api_key = os.getenv('BYBIT_API_KEY')
+    api_secret = os.getenv('BYBIT_API_SECRET')
+    use_testnet = get_env_str('BYBIT_TESTNET', 'false').lower() == 'true'
+    use_demo = get_env_str('BYBIT_DEMO', 'false').lower() == 'true'
 
     if not api_key or not api_secret:
-        raise ValueError("BINANCE_API_KEY and BINANCE_API_SECRET required in .env")
+        raise ValueError("BYBIT_API_KEY and BYBIT_API_SECRET required in .env")
+
+    common_kwargs = {
+        "api_key": api_key,
+        "api_secret": api_secret,
+        "product_types": [BybitProductType.LINEAR],
+        "instrument_provider": InstrumentProviderConfig(load_all=True),
+    }
+
+    # Support both older (demo/testnet flags) and newer (environment enum) Nautilus APIs.
+    if BybitEnvironment is not None:
+        if use_demo:
+            environment = BybitEnvironment.DEMO
+        elif use_testnet:
+            environment = BybitEnvironment.TESTNET
+        else:
+            environment = BybitEnvironment.MAINNET
+        common_kwargs["environment"] = environment
+    else:
+        common_kwargs["demo"] = use_demo
+        common_kwargs["testnet"] = use_testnet
 
     # Data client config
-    data_config = BinanceDataClientConfig(
-        api_key=api_key,
-        api_secret=api_secret,
-        account_type=BinanceAccountType.USDT_FUTURES,  # Binance Futures
-        testnet=False,  # Set to True for testnet
-        instrument_provider=InstrumentProviderConfig(load_all=True),
-    )
+    data_config = BybitDataClientConfig(**common_kwargs)
 
     # Execution client config
-    exec_config = BinanceExecClientConfig(
-        api_key=api_key,
-        api_secret=api_secret,
-        account_type=BinanceAccountType.USDT_FUTURES,
-        testnet=False,
-        instrument_provider=InstrumentProviderConfig(load_all=True),
-    )
+    exec_config = BybitExecClientConfig(**common_kwargs)
 
     return data_config, exec_config
 
@@ -248,7 +269,7 @@ def setup_trading_node() -> TradingNodeConfig:
     """
     # Get configurations
     strategy_config = get_strategy_config()
-    data_config, exec_config = get_binance_config()
+    data_config, exec_config = get_bybit_config()
 
     # Wrap strategy config in ImportableStrategyConfig
     importable_config = ImportableStrategyConfig(
@@ -282,11 +303,11 @@ def setup_trading_node() -> TradingNodeConfig:
         ),
         # Data clients
         data_clients={
-            "BINANCE": data_config,
+            BYBIT: data_config,
         },
         # Execution clients
         exec_clients={
-            "BINANCE": exec_config,
+            BYBIT: exec_config,
         },
         # Strategy configs
         strategies=[importable_config],
@@ -302,8 +323,8 @@ def main():
     print("=" * 70)
     print("DeepSeek AI Trading Strategy - Live Trading Mode")
     print("=" * 70)
-    print(f"Exchange: Binance Futures (USDT-M)")
-    print(f"Instrument: BTCUSDT-PERP")
+    print(f"Exchange: Bybit (Linear Perpetuals)")
+    print(f"Instrument: {os.getenv('INSTRUMENT_ID', 'BTCUSDT-LINEAR.BYBIT')}")
     print(f"Strategy: AI-powered with DeepSeek")
     print("=" * 70)
 
@@ -329,16 +350,16 @@ def main():
 
     print(f"✅ Trader ID: {config.trader_id}")
     print(f"✅ Strategy configured with DeepSeek AI")
-    print(f"✅ Binance Futures adapter configured")
+    print(f"✅ Bybit adapter configured")
 
     # Create and start trading node
     print("\n🚀 Starting trading node...")
     node = TradingNode(config=config)
     
-    # Register Binance factories
-    node.add_data_client_factory("BINANCE", BinanceLiveDataClientFactory)
-    node.add_exec_client_factory("BINANCE", BinanceLiveExecClientFactory)
-    print("✅ Binance factories registered")
+    # Register Bybit factories
+    node.add_data_client_factory(BYBIT, BybitLiveDataClientFactory)
+    node.add_exec_client_factory(BYBIT, BybitLiveExecClientFactory)
+    print("✅ Bybit factories registered")
 
     try:
         # Build the node (connects to exchange, loads instruments)
