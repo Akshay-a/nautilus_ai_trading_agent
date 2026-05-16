@@ -115,7 +115,7 @@ strategy:
     feature_buffer_size: 500         # Ring buffer for computed feature vectors
     ema_alpha: 0.05                  # EMA smoothing for feature series
     trade_window_sec: 300            # Rolling trade-flow window (seconds)
-    log_interval: 60                 # Log summary every N depth updates
+    log_interval: 600                # Log summary every N depth updates (~1/min at 10 updates/sec)
 
   # Timing
   timer_interval_sec: 900  # 15 minutes for production (reduced API costs and avoid overtrading)

@@ -51,8 +51,25 @@ class PositionState:
 
 
 def _latest_json_log() -> Optional[Path]:
-    candidates = sorted(glob(str(LOG_DIR / "deepseek_trader_*.json")))
-    return Path(candidates[-1]) if candidates else None
+    """
+    Return the log file most recently modified (not just alphabetically last).
+
+    Nautilus rotates files as:
+      deepseek_trader_TIMESTAMP.json   <- current active file
+      deepseek_trader_TIMESTAMP.json.1 <- first backup
+      deepseek_trader_TIMESTAMP.json.2 <- second backup
+
+    After rotation the SAME base name is reused for the active file, so
+    alphabetical sort is unreliable.  Sort by mtime instead.
+    """
+    # Include both .json and .json.N backup files
+    candidates = glob(str(LOG_DIR / "deepseek_trader_*.json"))
+    candidates += glob(str(LOG_DIR / "deepseek_trader_*.json.[0-9]*"))
+    if not candidates:
+        return None
+    # Pick the file modified most recently
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return Path(candidates[0])
 
 
 def _parse_env_file(path: Path) -> Dict[str, str]:
@@ -101,6 +118,46 @@ def _strategy_process_state() -> Dict[str, Any]:
     return {"running": running, "pid": pid}
 
 
+def _session_log_files() -> List[Path]:
+    """
+    Return all log files for the current session, oldest → newest.
+
+    Nautilus rotates files in-place: when a file exceeds max_size it is
+    renamed to .json.1 (.json.2, etc.) and the SAME base name is used for
+    fresh output.  We therefore collect the base file + its numbered
+    backups, then sort by mtime (oldest first) so we replay events in
+    chronological order.
+    """
+    candidates = glob(str(LOG_DIR / "deepseek_trader_*.json"))
+    candidates += glob(str(LOG_DIR / "deepseek_trader_*.json.[0-9]*"))
+    if not candidates:
+        return []
+
+    # Group by base name (strip the trailing .N suffix if present)
+    # and find the session that was most recently modified
+    by_mtime = sorted(candidates, key=lambda p: os.path.getmtime(p), reverse=True)
+    if not by_mtime:
+        return []
+
+    # The newest file tells us the active base name
+    newest = by_mtime[0]
+    base = newest
+    # Strip .N suffix to get the base log filename
+    for part in by_mtime:
+        if not part.endswith((".1", ".2", ".3")):
+            base = part
+            break
+
+    base_path = Path(base)
+    # Remove .json extension then add back to build the pattern
+    stem = base_path.stem  # e.g. deepseek_trader_2026-05-16_095345:520
+    session_files = [p for p in candidates if Path(p).stem == stem or Path(p).name.startswith(base_path.name)]
+
+    # Sort oldest → newest (backup .1 is older than current .json)
+    session_files.sort(key=lambda p: os.path.getmtime(p))
+    return [Path(p) for p in session_files]
+
+
 def _parse_log_metrics(log_path: Optional[Path]) -> Dict[str, Any]:
     metrics: Dict[str, Any] = {
         "log_file": str(log_path) if log_path else None,
@@ -123,94 +180,117 @@ def _parse_log_metrics(log_path: Optional[Path]) -> Dict[str, Any]:
         "recent_events": [],
         "recent_warnings_errors": [],
     }
-    if log_path is None or not log_path.exists():
-        return metrics
+
+    # Read all rotated files for this session in chronological order
+    all_files = _session_log_files()
+    if not all_files:
+        if log_path is not None and log_path.exists():
+            all_files = [log_path]
+        else:
+            return metrics
+
+    metrics["log_file"] = str(all_files[-1])  # show active file in UI
 
     position: Optional[PositionState] = None
 
-    with log_path.open("r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+    for file_path in all_files:
+        if not file_path.exists():
+            continue
+        with file_path.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
 
-            ts = entry.get("timestamp")
-            msg = entry.get("message", "")
-            level = entry.get("level", "INFO")
+                ts = entry.get("timestamp")
+                msg = entry.get("message", "")
+                level = entry.get("level", "INFO")
 
-            if ts:
-                metrics["log_timestamp_utc"] = ts
+                if ts:
+                    metrics["log_timestamp_utc"] = ts
 
-            if "Strategy started successfully" in msg:
-                metrics["strategy_started"] = True
-            if msg == "RUNNING":
-                metrics["strategy_running_log"] = True
+                if "Strategy started successfully" in msg:
+                    metrics["strategy_started"] = True
+                if msg == "RUNNING":
+                    metrics["strategy_running_log"] = True
 
-            m_warmup = RE_WARMUP.search(msg)
-            if m_warmup:
-                metrics["warmup_bars"] = int(m_warmup.group(1))
+                m_warmup = RE_WARMUP.search(msg)
+                if m_warmup:
+                    metrics["warmup_bars"] = int(m_warmup.group(1))
+                # Also catch the actual prefetch log format
+                m_prefetch = re.search(r"Pre-fetched\s+([0-9]+)\s+bars", msg)
+                if m_prefetch:
+                    metrics["warmup_bars"] = int(m_prefetch.group(1))
 
-            if "Running periodic analysis..." in msg:
-                metrics["analysis_cycles"] += 1
+                if "Running periodic analysis..." in msg:
+                    metrics["analysis_cycles"] += 1
 
-            m_price = RE_PRICE.search(msg)
-            if m_price:
-                metrics["last_price"] = float(m_price.group(1).replace(",", ""))
+                m_price = RE_PRICE.search(msg)
+                if m_price:
+                    metrics["last_price"] = float(m_price.group(1).replace(",", ""))
 
-            if msg.startswith("Overall Trend:"):
-                metrics["last_trend"] = msg.split(":", 1)[1].strip()
+                if msg.startswith("Overall Trend:"):
+                    metrics["last_trend"] = msg.split(":", 1)[1].strip()
 
-            m_rsi = RE_RSI.search(msg)
-            if m_rsi:
-                metrics["last_rsi"] = float(m_rsi.group(1))
+                m_rsi = RE_RSI.search(msg)
+                if m_rsi:
+                    metrics["last_rsi"] = float(m_rsi.group(1))
 
-            m_signal = RE_SIGNAL.search(msg)
-            if m_signal:
-                signal, confidence, api_sec, reason = m_signal.groups()
-                metrics["deepseek_calls"] += 1
-                metrics["last_signal"] = {"signal": signal, "confidence": confidence}
-                metrics["last_signal_api_sec"] = float(api_sec)
-                metrics["last_signal_reason"] = reason.strip()
+                m_signal = RE_SIGNAL.search(msg)
+                if m_signal:
+                    signal, confidence, api_sec, reason = m_signal.groups()
+                    metrics["deepseek_calls"] += 1
+                    metrics["last_signal"] = {"signal": signal, "confidence": confidence}
+                    metrics["last_signal_api_sec"] = float(api_sec)
+                    metrics["last_signal_reason"] = reason.strip()
 
-            if "DRY RUN" in msg:
-                metrics["dry_run_events"] += 1
+                if "DRY RUN" in msg:
+                    metrics["dry_run_events"] += 1
 
-            m_pos_cur = RE_POSITION_CURRENT.search(msg)
-            if m_pos_cur:
-                side, qty, entry_px = m_pos_cur.groups()
-                position = PositionState(side=side.upper(), quantity=float(qty), entry_price=float(entry_px.replace(",", "")))
+                m_pos_cur = RE_POSITION_CURRENT.search(msg)
+                if m_pos_cur:
+                    side, qty, entry_px = m_pos_cur.groups()
+                    position = PositionState(
+                        side=side.upper(),
+                        quantity=float(qty),
+                        entry_price=float(entry_px.replace(",", "")),
+                    )
 
-            m_pos_open = RE_POSITION_OPENED.search(msg)
-            if m_pos_open:
-                side, qty, entry_px = m_pos_open.groups()
-                position = PositionState(side=side.upper(), quantity=float(qty), entry_price=float(entry_px))
+                m_pos_open = RE_POSITION_OPENED.search(msg)
+                if m_pos_open:
+                    side, qty, entry_px = m_pos_open.groups()
+                    position = PositionState(
+                        side=side.upper(),
+                        quantity=float(qty),
+                        entry_price=float(entry_px),
+                    )
 
-            m_pos_closed = RE_POSITION_CLOSED.search(msg)
-            if m_pos_closed:
-                _, pnl = m_pos_closed.groups()
-                metrics["closed_trades"] += 1
-                metrics["realized_pnl_usdt"] += float(pnl)
-                position = None
+                m_pos_closed = RE_POSITION_CLOSED.search(msg)
+                if m_pos_closed:
+                    _, pnl = m_pos_closed.groups()
+                    metrics["closed_trades"] += 1
+                    metrics["realized_pnl_usdt"] += float(pnl)
+                    position = None
 
-            important = (
-                "Signal:" in msg
-                or "Current Price:" in msg
-                or "Position opened:" in msg
-                or "Position closed:" in msg
-                or "DRY RUN" in msg
-                or "Order rejected" in msg
-                or "Warning:" in msg
-            )
-            if important:
-                metrics["recent_events"].append({"ts": ts, "level": level, "message": msg})
-                if len(metrics["recent_events"]) > 25:
-                    metrics["recent_events"] = metrics["recent_events"][-25:]
+                important = (
+                    "Signal:" in msg
+                    or "Current Price:" in msg
+                    or "Position opened:" in msg
+                    or "Position closed:" in msg
+                    or "DRY RUN" in msg
+                    or "Order rejected" in msg
+                    or "Warning:" in msg
+                )
+                if important:
+                    metrics["recent_events"].append({"ts": ts, "level": level, "message": msg})
+                    if len(metrics["recent_events"]) > 25:
+                        metrics["recent_events"] = metrics["recent_events"][-25:]
 
-            if level in {"WARN", "ERROR"}:
-                metrics["recent_warnings_errors"].append({"ts": ts, "level": level, "message": msg})
-                if len(metrics["recent_warnings_errors"]) > 10:
-                    metrics["recent_warnings_errors"] = metrics["recent_warnings_errors"][-10:]
+                if level in {"WARN", "ERROR"}:
+                    metrics["recent_warnings_errors"].append({"ts": ts, "level": level, "message": msg})
+                    if len(metrics["recent_warnings_errors"]) > 10:
+                        metrics["recent_warnings_errors"] = metrics["recent_warnings_errors"][-10:]
 
     if position:
         metrics["open_position"] = {
@@ -224,9 +304,9 @@ def _parse_log_metrics(log_path: Optional[Path]) -> Dict[str, Any]:
 
 def collect_status() -> Dict[str, Any]:
     env_cfg = _parse_env_file(ENV_FILE)
-    log_path = _latest_json_log()
+    log_path = _latest_json_log()  # still used as fallback
     proc = _strategy_process_state()
-    metrics = _parse_log_metrics(log_path)
+    metrics = _parse_log_metrics(log_path)  # _parse_log_metrics calls _session_log_files internally
 
     now_utc = datetime.now(timezone.utc).isoformat()
     mode = {

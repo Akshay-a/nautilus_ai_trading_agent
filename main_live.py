@@ -300,8 +300,8 @@ def setup_trading_node() -> TradingNodeConfig:
         log_file_format="json",
         log_colors=True,
         bypass_logging=False,
-        log_file_max_size=10_485_760,  # 10MB in bytes (10 * 1024 * 1024)
-        log_file_max_backup_count=3,   # Keep 3 backup files (total: 40MB max)
+        log_file_max_size=104_857_600,  # 100MB -- prevents mid-session rotation from high-frequency OB logs
+        log_file_max_backup_count=2,    # Keep 2 backup files (total: 300MB max)
     )
 
     # Trading node config
