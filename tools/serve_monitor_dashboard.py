@@ -99,26 +99,51 @@ def _parse_env_file(path: Path) -> Dict[str, str]:
 
 
 def _strategy_process_state() -> Dict[str, Any]:
+    def _is_main_live_process(candidate_pid: int) -> bool:
+        """
+        Return True only when PID exists and is a Python main_live process.
+        """
+        try:
+            ps = subprocess.run(
+                ["ps", "-p", str(candidate_pid), "-o", "command="],
+                capture_output=True,
+                text=True,
+            )
+            if ps.returncode != 0:
+                return False
+            cmd = ps.stdout.strip()
+            if not cmd:
+                return False
+            cmd_lower = cmd.lower()
+            return "python" in cmd_lower and "main_live.py" in cmd_lower
+        except Exception:
+            return False
+
     running = False
     pid: Optional[int] = None
 
     if PID_FILE.exists():
         try:
-            pid = int(PID_FILE.read_text(encoding="utf-8").strip())
-            check = subprocess.run(["ps", "-p", str(pid)], capture_output=True, text=True)
-            running = check.returncode == 0 and str(pid) in check.stdout
+            candidate = int(PID_FILE.read_text(encoding="utf-8").strip())
+            if _is_main_live_process(candidate):
+                pid = candidate
+                running = True
         except Exception:
             pid = None
 
     if not running:
-        pgrep = subprocess.run(["pgrep", "-f", "python.*main_live.py"], capture_output=True, text=True)
+        pgrep = subprocess.run(["pgrep", "-f", "main_live.py"], capture_output=True, text=True)
         if pgrep.returncode == 0 and pgrep.stdout.strip():
-            first_pid = pgrep.stdout.strip().splitlines()[0]
-            try:
-                pid = int(first_pid)
-            except ValueError:
-                pid = None
-            running = True
+            # Prefer the highest PID to reduce stale-process selection.
+            for raw_pid in sorted(pgrep.stdout.strip().splitlines(), reverse=True):
+                try:
+                    candidate = int(raw_pid)
+                except ValueError:
+                    continue
+                if _is_main_live_process(candidate):
+                    pid = candidate
+                    running = True
+                    break
 
     return {"running": running, "pid": pid}
 
