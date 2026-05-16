@@ -30,8 +30,9 @@ from nautilus_trader.trading.config import ImportableStrategyConfig
 from strategy.deepseek_strategy import DeepSeekAIStrategy, DeepSeekAIStrategyConfig
 
 
-# Load environment variables
-load_dotenv()
+# Load environment variables from local .env and override inherited shell vars.
+# This avoids stale OS-level secrets causing key/secret mismatches at runtime.
+load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 
 
 def load_yaml_config() -> dict:
@@ -196,6 +197,16 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
 
         # Execution
         position_adjustment_threshold=0.001,
+
+        # Order Book / Microstructure
+        enable_orderbook=strategy_yaml.get('orderbook', {}).get('enabled', True),
+        orderbook_depth_levels=strategy_yaml.get('orderbook', {}).get('depth_levels', 10),
+        orderbook_depth_buffer_size=strategy_yaml.get('orderbook', {}).get('depth_buffer_size', 300),
+        orderbook_trade_buffer_size=strategy_yaml.get('orderbook', {}).get('trade_buffer_size', 5000),
+        orderbook_feature_buffer_size=strategy_yaml.get('orderbook', {}).get('feature_buffer_size', 500),
+        orderbook_ema_alpha=strategy_yaml.get('orderbook', {}).get('ema_alpha', 0.05),
+        orderbook_trade_window_sec=strategy_yaml.get('orderbook', {}).get('trade_window_sec', 300),
+        orderbook_log_interval=strategy_yaml.get('orderbook', {}).get('log_interval', 60),
 
         # Timing - Load from YAML config (default: 900 seconds = 15 minutes)
         timer_interval_sec=get_env_int('TIMER_INTERVAL_SEC', str(strategy_yaml.get('timer_interval_sec', 900))),

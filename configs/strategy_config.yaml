@@ -106,6 +106,17 @@ strategy:
     reduce_only_for_closes: true
     position_adjustment_threshold: 0.001  # Min 0.001 BTC difference to adjust
 
+  # Order Book / Microstructure
+  orderbook:
+    enabled: true                    # Subscribe to L2 depth + trade ticks
+    depth_levels: 10                 # Top N levels to track
+    depth_buffer_size: 300           # Ring buffer for raw depth snapshots
+    trade_buffer_size: 5000          # Ring buffer for trade ticks
+    feature_buffer_size: 500         # Ring buffer for computed feature vectors
+    ema_alpha: 0.05                  # EMA smoothing for feature series
+    trade_window_sec: 300            # Rolling trade-flow window (seconds)
+    log_interval: 60                 # Log summary every N depth updates
+
   # Timing
   timer_interval_sec: 900  # 15 minutes for production (reduced API costs and avoid overtrading)
 

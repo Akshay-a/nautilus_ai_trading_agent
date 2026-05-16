@@ -25,6 +25,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from indicators.technical_manager import TechnicalIndicatorManager
+from indicators.orderbook_manager import OrderBookManager
 from utils.deepseek_client import DeepSeekAnalyzer
 from utils.sentiment_client import SentimentDataFetcher
 # OCOManager no longer needed - using NautilusTrader's built-in bracket orders
@@ -117,6 +118,16 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
 
     # Execution
     position_adjustment_threshold: float = 0.001
+
+    # Order Book / Microstructure
+    enable_orderbook: bool = True
+    orderbook_depth_levels: int = 10
+    orderbook_depth_buffer_size: int = 300
+    orderbook_trade_buffer_size: int = 5000
+    orderbook_feature_buffer_size: int = 500
+    orderbook_ema_alpha: float = 0.05
+    orderbook_trade_window_sec: int = 300  # 5 minutes
+    orderbook_log_interval: int = 60  # log summary every N depth updates
 
     # Timing
     timer_interval_sec: int = 900
@@ -217,6 +228,20 @@ class DeepSeekAIStrategy(Strategy):
             bb_period=config.bb_period,
             bb_std=config.bb_std,
         )
+
+        # Order Book / Microstructure manager
+        self.enable_orderbook = config.enable_orderbook
+        self.orderbook_manager: Optional[OrderBookManager] = None
+        if self.enable_orderbook:
+            self.orderbook_manager = OrderBookManager(
+                depth_buffer_size=config.orderbook_depth_buffer_size,
+                trade_buffer_size=config.orderbook_trade_buffer_size,
+                feature_buffer_size=config.orderbook_feature_buffer_size,
+                depth_levels=config.orderbook_depth_levels,
+                ema_alpha=config.orderbook_ema_alpha,
+                trade_window_ns=config.orderbook_trade_window_sec * 1_000_000_000,
+            )
+            self._ob_log_interval = config.orderbook_log_interval
 
         # DeepSeek AI analyzer
         api_key = config.deepseek_api_key or os.getenv('DEEPSEEK_API_KEY')
@@ -373,6 +398,20 @@ class DeepSeekAIStrategy(Strategy):
         self.subscribe_bars(self.bar_type)
         self.log.info(f"Subscribed to {self.bar_type}")
 
+        # Subscribe to order book depth and trade ticks
+        if self.enable_orderbook:
+            try:
+                self.subscribe_order_book_deltas(self.instrument_id)
+                self.log.info(f"Subscribed to order book deltas for {self.instrument_id}")
+            except Exception as e:
+                self.log.warning(f"Failed to subscribe to order book deltas: {e}")
+
+            try:
+                self.subscribe_trade_ticks(self.instrument_id)
+                self.log.info(f"Subscribed to trade ticks for {self.instrument_id}")
+            except Exception as e:
+                self.log.warning(f"Failed to subscribe to trade ticks: {e}")
+
         # Set up timer for periodic analysis
         self.clock.set_timer(
             name="analysis_timer",
@@ -416,6 +455,15 @@ class DeepSeekAIStrategy(Strategy):
 
         # Unsubscribe from data
         self.unsubscribe_bars(self.bar_type)
+        if self.enable_orderbook:
+            try:
+                self.unsubscribe_order_book_deltas(self.instrument_id)
+            except Exception:
+                pass
+            try:
+                self.unsubscribe_trade_ticks(self.instrument_id)
+            except Exception:
+                pass
 
         self.log.info("Strategy stopped")
 
@@ -574,6 +622,56 @@ class DeepSeekAIStrategy(Strategy):
                 f"O:{bar.open} H:{bar.high} L:{bar.low} C:{bar.close} V:{bar.volume}"
             )
 
+    def on_order_book_deltas(self, deltas) -> None:
+        """
+        Handle order book delta updates.
+
+        The Nautilus DataEngine maintains the book internally; we read
+        the managed book from cache to get a consistent multi-level
+        snapshot for feature engineering.
+        """
+        if self.orderbook_manager is None:
+            return
+
+        book = self.cache.order_book(self.instrument_id)
+        if book is None:
+            return
+
+        ts = deltas.ts_event if hasattr(deltas, "ts_event") else 0
+        self.orderbook_manager.update_from_managed_book(book, ts_event=ts)
+
+        n = self.orderbook_manager.depth_updates_received
+        if n == 1 or (self._ob_log_interval and n % self._ob_log_interval == 0):
+            summary = self.orderbook_manager.get_summary()
+            self.log.info(
+                f"📊 OrderBook #{n}: "
+                f"bid={summary.get('best_bid', 0):.2f} "
+                f"ask={summary.get('best_ask', 0):.2f} "
+                f"spread={summary.get('spread_bps', 0):.1f}bps "
+                f"tob_imb={summary.get('tob_imbalance', 0):+.3f} "
+                f"ofi={summary.get('ema_ofi', 0):+.4f} "
+                f"trades={summary.get('trade_ticks', 0)}"
+            )
+
+    def on_order_book_depth(self, depth) -> None:
+        """
+        Handle OrderBookDepth10 snapshot updates (alternative subscription path).
+        """
+        if self.orderbook_manager is None:
+            return
+        self.orderbook_manager.update_depth(depth)
+
+    def on_trade_tick(self, tick) -> None:
+        """
+        Handle individual trade tick updates.
+
+        Each tick carries price, size and aggressor side.  We feed these
+        to the OrderBookManager to compute trade-flow features.
+        """
+        if self.orderbook_manager is None:
+            return
+        self.orderbook_manager.update_trade(tick)
+
     def on_timer(self, event):
         """
         Periodic analysis and trading logic.
@@ -618,6 +716,11 @@ class DeepSeekAIStrategy(Strategy):
             except Exception as e:
                 self.log.warning(f"Failed to fetch sentiment data: {e}")
 
+        # Get microstructure data (if order book is active)
+        microstructure_data = None
+        if self.orderbook_manager and self.orderbook_manager.is_ready():
+            microstructure_data = self.orderbook_manager.get_summary()
+
         # Build price data for AI
         price_data = {
             'price': current_price,
@@ -628,6 +731,8 @@ class DeepSeekAIStrategy(Strategy):
             'price_change': self._calculate_price_change(),
             'kline_data': kline_data,
         }
+        if microstructure_data:
+            price_data['microstructure'] = microstructure_data
 
         # Get current position
         current_position = self._get_current_position_data()
@@ -636,6 +741,16 @@ class DeepSeekAIStrategy(Strategy):
         self.log.info(f"Current Price: ${current_price:,.2f}")
         self.log.info(f"Overall Trend: {technical_data.get('overall_trend', 'N/A')}")
         self.log.info(f"RSI: {technical_data.get('rsi', 0):.2f}")
+        if microstructure_data:
+            self.log.info(
+                f"📊 Microstructure: "
+                f"spread={microstructure_data.get('spread_bps', 0):.1f}bps "
+                f"microprice={microstructure_data.get('microprice', 0):.2f} "
+                f"tob_imb={microstructure_data.get('tob_imbalance', 0):+.3f} "
+                f"depth_imb={microstructure_data.get('depth_imbalance', 0):+.3f} "
+                f"ofi={microstructure_data.get('ema_ofi', 0):+.4f} "
+                f"tf_imb={microstructure_data.get('trade_flow_imbalance', 0):+.3f}"
+            )
         if current_position:
             self.log.info(
                 f"Current Position: {current_position['side']} "
