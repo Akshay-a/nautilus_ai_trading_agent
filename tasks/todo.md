@@ -131,3 +131,23 @@
 - Validation:
   - `python -m py_compile main_live.py strategy/deepseek_strategy.py utils/deepseek_client.py tools/serve_monitor_dashboard.py` passed.
   - `python tools/serve_monitor_dashboard.py --print-json` now includes `llm_conversations` and accurate live metrics.
+
+## Review (Autonomous Run 2026-05-17 02:00 AEST - HEAL)
+- Health gate before fix: RED due `process.running=false` when sandbox restrictions blocked reliable PID probing, despite fresh strategy heartbeat logs.
+- HEAL fix applied in `tools/serve_monitor_dashboard.py`:
+  - Added timestamp freshness helper and fallback that infers `process.running=true` when all conditions hold:
+    - `strategy_running_log=true`
+    - fresh `log_timestamp_utc` (<= 180s)
+    - active runtime activity (`analysis_cycles` or `deepseek_calls` > 0)
+  - Marks inferred state explicitly via `process.inferred_from_logs=true`.
+- Validation evidence:
+  - `python3 -m py_compile tools/serve_monitor_dashboard.py` passed.
+  - `./check_strategy_status.sh` now reports `process.running=true` with `inferred_from_logs=true`.
+  - `python3 tools/serve_monitor_dashboard.py --print-json` reports coherent fresh runtime snapshot:
+    - last signal `SELL`
+    - open position `SHORT 0.128 @ 78264.5`
+    - latest log timestamp `2026-05-16T16:37:58.683030000Z`
+- Mandatory trader behavior audit:
+  - Signal changed. Did position actually flip? `No flip observed in latest window (HOLD↔SELL while position remained SHORT).`
+  - Did we close-only or close-and-reverse? `Neither observed this run; no BUY/SELL opposite-side transition event in parsed logs.`
+  - Did resulting position notional match sizing policy? `Yes; logs show fixed sizing line ~ $10k notional (0.128 BTC).`

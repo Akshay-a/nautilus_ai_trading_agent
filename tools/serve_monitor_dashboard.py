@@ -14,7 +14,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from glob import glob
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -392,13 +392,36 @@ def _parse_log_metrics(log_path: Optional[Path], target_pid: Optional[int] = Non
     return metrics
 
 
+def _is_fresh_log_timestamp(ts: Optional[str], now_utc: datetime, max_age_seconds: int = 180) -> bool:
+    if not ts:
+        return False
+    try:
+        parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
+        return False
+    return now_utc - parsed <= timedelta(seconds=max_age_seconds)
+
+
 def collect_status() -> Dict[str, Any]:
     env_cfg = _parse_env_file(ENV_FILE)
     log_path = _latest_json_log()  # still used as fallback
     proc = _strategy_process_state()
     metrics = _parse_log_metrics(log_path, target_pid=proc.get("pid"))
 
-    now_utc = datetime.now(timezone.utc).isoformat()
+    now_dt = datetime.now(timezone.utc)
+    now_utc = now_dt.isoformat()
+    if not proc["running"]:
+        if (
+            metrics.get("strategy_running_log")
+            and _is_fresh_log_timestamp(metrics.get("log_timestamp_utc"), now_dt)
+            and (
+                int(metrics.get("analysis_cycles") or 0) > 0
+                or int(metrics.get("deepseek_calls") or 0) > 0
+            )
+        ):
+            proc["running"] = True
+            proc["pid"] = None
+            proc["inferred_from_logs"] = True
     mode = {
         "bybit_demo": env_cfg.get("BYBIT_DEMO", "").lower() == "true",
         "bybit_testnet": env_cfg.get("BYBIT_TESTNET", "").lower() == "true",

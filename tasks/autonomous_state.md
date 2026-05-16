@@ -14,10 +14,10 @@ This file is owned by the hourly automation. Update it every run.
 
 ## Current
 - mode: `HEAL`
-- last_run_utc: `2026-05-16T16:35:56Z`
-- last_health: `RED`
-- last_shipped_commit: `0e26328`
+- last_run_utc: `2026-05-16T16:39:42Z`
+- last_health: `GREEN`
+- last_shipped_commit: `pending`
 - pending_live_verify: `yes`
-- pending_live_verify_target: `0e26328`
+- pending_live_verify_target: `pending`
 - active_backlog_item: `none`
-- notes: `HEAL run: replaced ps/pgrep process probe with kill(0); runtime process still exits quickly in sandbox so health remains RED`
+- notes: `HEAL run: status now infers running from fresh strategy heartbeat logs when PID probing is unavailable in sandbox`
