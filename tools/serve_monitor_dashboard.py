@@ -13,7 +13,6 @@ import argparse
 import json
 import os
 import re
-import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from glob import glob
@@ -99,23 +98,11 @@ def _parse_env_file(path: Path) -> Dict[str, str]:
 
 
 def _strategy_process_state() -> Dict[str, Any]:
-    def _is_main_live_process(candidate_pid: int) -> bool:
-        """
-        Return True only when PID exists and is a Python main_live process.
-        """
+    def _is_pid_alive(candidate_pid: int) -> bool:
+        """Portable liveness probe that does not depend on `ps`/`pgrep`."""
         try:
-            ps = subprocess.run(
-                ["ps", "-p", str(candidate_pid), "-o", "command="],
-                capture_output=True,
-                text=True,
-            )
-            if ps.returncode != 0:
-                return False
-            cmd = ps.stdout.strip()
-            if not cmd:
-                return False
-            cmd_lower = cmd.lower()
-            return "python" in cmd_lower and "main_live.py" in cmd_lower
+            os.kill(candidate_pid, 0)
+            return True
         except Exception:
             return False
 
@@ -125,25 +112,11 @@ def _strategy_process_state() -> Dict[str, Any]:
     if PID_FILE.exists():
         try:
             candidate = int(PID_FILE.read_text(encoding="utf-8").strip())
-            if _is_main_live_process(candidate):
+            if _is_pid_alive(candidate):
                 pid = candidate
                 running = True
         except Exception:
             pid = None
-
-    if not running:
-        pgrep = subprocess.run(["pgrep", "-f", "main_live.py"], capture_output=True, text=True)
-        if pgrep.returncode == 0 and pgrep.stdout.strip():
-            # Prefer the highest PID to reduce stale-process selection.
-            for raw_pid in sorted(pgrep.stdout.strip().splitlines(), reverse=True):
-                try:
-                    candidate = int(raw_pid)
-                except ValueError:
-                    continue
-                if _is_main_live_process(candidate):
-                    pid = candidate
-                    running = True
-                    break
 
     return {"running": running, "pid": pid}
 
