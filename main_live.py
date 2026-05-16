@@ -110,7 +110,18 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
     # Get strategy parameters from env or use defaults
     equity = get_env_float('EQUITY', str(strategy_yaml.get('equity', '400')))
     leverage = get_env_float('LEVERAGE', str(strategy_yaml.get('leverage', '10')))
-    base_position = get_env_float('BASE_POSITION_USDT', str(strategy_yaml.get('position_management', {}).get('base_usdt_amount', '30')))
+    base_position = get_env_float(
+        'BASE_POSITION_USDT',
+        str(strategy_yaml.get('position_management', {}).get('base_usdt_amount', '30')),
+    )
+    fixed_trade_usdt = get_env_float(
+        'FIXED_TRADE_USDT',
+        str(strategy_yaml.get('position_management', {}).get('fixed_trade_usdt', '0')),
+    )
+    max_position_ratio = get_env_float(
+        'MAX_POSITION_RATIO',
+        str(strategy_yaml.get('position_management', {}).get('max_position_ratio', '0.10')),
+    )
     timeframe = get_env_str('TIMEFRAME', '1m')  # Fast loop default for demo iteration
     instrument_id = get_env_str(
         'INSTRUMENT_ID',
@@ -120,6 +131,8 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
     # Debug output
     print(f"[CONFIG] Equity: {equity}")
     print(f"[CONFIG] Base Position: {base_position}")
+    print(f"[CONFIG] Fixed Trade Notional: {fixed_trade_usdt}")
+    print(f"[CONFIG] Max Position Ratio: {max_position_ratio}")
     print(f"[CONFIG] Timeframe: {timeframe}")
 
     # Map timeframe to bar aggregation
@@ -159,10 +172,11 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
 
         # Position sizing
         base_usdt_amount=base_position,
+        fixed_trade_usdt=fixed_trade_usdt,
         high_confidence_multiplier=get_env_float('HIGH_CONFIDENCE_MULTIPLIER', '1.5'),
         medium_confidence_multiplier=get_env_float('MEDIUM_CONFIDENCE_MULTIPLIER', '1.0'),
         low_confidence_multiplier=get_env_float('LOW_CONFIDENCE_MULTIPLIER', '0.5'),
-        max_position_ratio=get_env_float('MAX_POSITION_RATIO', '0.10'),
+        max_position_ratio=max_position_ratio,
         trend_strength_multiplier=get_env_float('TREND_STRENGTH_MULTIPLIER', '1.2'),
         min_trade_amount=0.001,
 

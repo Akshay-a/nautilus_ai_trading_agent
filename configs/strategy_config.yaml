@@ -8,16 +8,17 @@ strategy:
   bar_type: "BTCUSDT-LINEAR.BYBIT-15-MINUTE-LAST-EXTERNAL"  # Production: 15-minute bars
 
   # Capital and leverage
-  equity: 400  # USDT (实际账户余额)
+  equity: 100000  # USDT reference equity for sizing caps
   leverage: 10
 
   # Position sizing
   position_management:
-    base_usdt_amount: 100  # Base position size (meets Binance $100 minimum notional)
+    base_usdt_amount: 10000  # Fallback base size when fixed_trade_usdt is disabled
+    fixed_trade_usdt: 10000  # Fixed notional per new entry/reversal (demo objective)
     high_confidence_multiplier: 1.5
     medium_confidence_multiplier: 1.0
     low_confidence_multiplier: 0.5
-    max_position_ratio: 0.30  # Max 30% of equity (120 USDT max with 400 equity)
+    max_position_ratio: 0.10  # Cap each position at 10% of equity
     trend_strength_multiplier: 1.2
     min_trade_amount: 0.001  # Minimum BTC amount
 

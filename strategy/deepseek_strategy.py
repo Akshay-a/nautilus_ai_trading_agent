@@ -44,6 +44,7 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
 
     # Position sizing
     base_usdt_amount: float = 100.0
+    fixed_trade_usdt: float = 0.0  # If > 0, use fixed notional target per entry/reversal
     high_confidence_multiplier: float = 1.5
     medium_confidence_multiplier: float = 1.0
     low_confidence_multiplier: float = 0.5
@@ -163,6 +164,7 @@ class DeepSeekAIStrategy(Strategy):
         self.equity = config.equity
         self.leverage = config.leverage
         self.base_usdt = config.base_usdt_amount
+        self.fixed_trade_usdt = config.fixed_trade_usdt
         self.position_config = {
             'high_confidence_multiplier': config.high_confidence_multiplier,
             'medium_confidence_multiplier': config.medium_confidence_multiplier,
@@ -988,33 +990,40 @@ class DeepSeekAIStrategy(Strategy):
 
         Returns BTC quantity based on confidence, trend, and RSI.
         """
-        # Base USDT amount
-        base_usdt = self.base_usdt
+        # Optional fixed-notional sizing for live/demo operations.
+        if self.fixed_trade_usdt > 0:
+            suggested_usdt = self.fixed_trade_usdt
+            sizing_reason = f"Fixed:${self.fixed_trade_usdt:.2f}"
+        else:
+            base_usdt = self.base_usdt
 
-        # Confidence multiplier
-        conf_mult = self.position_config.get(
-            f"{signal_data['confidence'].lower()}_confidence_multiplier",
-            1.0
-        )
+            # Confidence multiplier
+            conf_mult = self.position_config.get(
+                f"{signal_data['confidence'].lower()}_confidence_multiplier",
+                1.0
+            )
 
-        # Trend multiplier
-        trend = technical_data.get('overall_trend', '震荡整理')
-        trend_mult = (
-            self.position_config['trend_strength_multiplier']
-            if trend in ['强势上涨', '强势下跌']
-            else 1.0
-        )
+            # Trend multiplier
+            trend = technical_data.get('overall_trend', '震荡整理')
+            trend_mult = (
+                self.position_config['trend_strength_multiplier']
+                if trend in ['强势上涨', '强势下跌']
+                else 1.0
+            )
 
-        # RSI multiplier (reduce size in extreme RSI)
-        rsi = technical_data.get('rsi', 50)
-        rsi_mult = (
-            self.rsi_extreme_mult
-            if rsi > self.rsi_extreme_upper or rsi < self.rsi_extreme_lower
-            else 1.0
-        )
+            # RSI multiplier (reduce size in extreme RSI)
+            rsi = technical_data.get('rsi', 50)
+            rsi_mult = (
+                self.rsi_extreme_mult
+                if rsi > self.rsi_extreme_upper or rsi < self.rsi_extreme_lower
+                else 1.0
+            )
 
-        # Calculate suggested USDT
-        suggested_usdt = base_usdt * conf_mult * trend_mult * rsi_mult
+            # Calculate suggested USDT
+            suggested_usdt = base_usdt * conf_mult * trend_mult * rsi_mult
+            sizing_reason = (
+                f"Base:{base_usdt} × Conf:{conf_mult} × Trend:{trend_mult} × RSI:{rsi_mult}"
+            )
 
         # Apply max position ratio limit
         max_usdt = self.equity * self.position_config['max_position_ratio']
@@ -1052,7 +1061,7 @@ class DeepSeekAIStrategy(Strategy):
 
         self.log.info(
             f"📊 Position Sizing: "
-            f"Base:{base_usdt} × Conf:{conf_mult} × Trend:{trend_mult} × RSI:{rsi_mult} "
+            f"{sizing_reason} "
             f"= ${final_usdt:.2f} = {btc_quantity:.3f} BTC "
             f"(notional: ${btc_quantity * current_price:.2f})"
         )
