@@ -7,7 +7,7 @@
 [![DeepSeek AI](https://img.shields.io/badge/DeepSeek-AI%20Powered-purple.svg)](https://www.deepseek.com/)
 [![License](https://img.shields.io/badge/license-Educational-orange.svg)](LICENSE)
 
-**Professional algorithmic trading system combining DeepSeek AI decision-making, advanced technical analysis, and institutional-grade risk management for automated BTC/USDT perpetual futures trading on Binance.**
+**Professional algorithmic trading system combining DeepSeek AI decision-making, advanced technical analysis,L2 Orderbook, and institutional-grade risk management for automated BTC/USDT perpetual futures trading on Bybit.**
 
 ---
 
