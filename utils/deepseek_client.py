@@ -151,6 +151,15 @@ class DeepSeekAnalyzer:
         prompt = self._build_analysis_prompt(
             price_data, technical_data, sentiment_data, current_position
         )
+        prompt_payload = self._build_prompt_payload(
+            price_data=price_data,
+            technical_data=technical_data,
+            sentiment_data=sentiment_data,
+            current_position=current_position,
+        )
+        self._log_info(
+            f"🤖 LLM Prompt Payload: {json.dumps(prompt_payload, ensure_ascii=False)}"
+        )
 
         # Call DeepSeek API
         response = self.client.chat.completions.create(
@@ -183,6 +192,10 @@ class DeepSeekAnalyzer:
             self._log_error(f"❌ JSON parse failed for response: {result[:200]}")
             return self._create_fallback_signal(price_data)
 
+        self._log_info(
+            f"🤖 LLM Response JSON: {json.dumps(signal_data, ensure_ascii=False)}"
+        )
+
         # Validate required fields
         required_fields = ["signal", "reason", "stop_loss", "take_profit", "confidence"]
         optional_fields = ["trend_strength", "risk_assessment"]
@@ -210,6 +223,81 @@ class DeepSeekAnalyzer:
         self._log_signal_stats(signal_data)
 
         return signal_data
+
+    def _build_prompt_payload(
+        self,
+        price_data: Dict[str, Any],
+        technical_data: Dict[str, Any],
+        sentiment_data: Optional[Dict[str, Any]],
+        current_position: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Build a concise structured payload for audit logs/dashboard.
+
+        This is intentionally compact so operators can inspect what the model saw
+        without dumping the full static instruction block every cycle.
+        """
+        kline_data = price_data.get("kline_data", []) or []
+        kline_summary = []
+        for bar in kline_data[-5:]:
+            kline_summary.append(
+                {
+                    "o": bar.get("open"),
+                    "h": bar.get("high"),
+                    "l": bar.get("low"),
+                    "c": bar.get("close"),
+                    "v": bar.get("volume"),
+                }
+            )
+
+        micro = price_data.get("microstructure") or {}
+        micro_summary = {}
+        for key in (
+            "spread_bps",
+            "tob_imbalance",
+            "depth_imbalance",
+            "ema_ofi",
+            "queue_pressure",
+            "trade_flow_imbalance",
+            "depth_regime",
+        ):
+            if key in micro:
+                micro_summary[key] = micro.get(key)
+
+        technical_summary = {}
+        for key in (
+            "overall_trend",
+            "short_term_trend",
+            "rsi",
+            "macd_trend",
+            "macd_histogram",
+            "support",
+            "resistance",
+        ):
+            if key in technical_data:
+                technical_summary[key] = technical_data.get(key)
+
+        sentiment_summary = None
+        if sentiment_data:
+            sentiment_summary = {}
+            for key in ("score", "label", "confidence", "timeframe", "source"):
+                if key in sentiment_data:
+                    sentiment_summary[key] = sentiment_data.get(key)
+
+        return {
+            "ts": price_data.get("timestamp"),
+            "price": price_data.get("price"),
+            "high": price_data.get("high"),
+            "low": price_data.get("low"),
+            "volume": price_data.get("volume"),
+            "price_change_pct": price_data.get("price_change"),
+            "position": current_position,
+            "technical": technical_summary,
+            "microstructure": micro_summary,
+            "kline_tail_5": kline_summary,
+            "sentiment": sentiment_summary,
+            "previous_signal": self.signal_history[-1] if self.signal_history else None,
+        }
 
     def _build_analysis_prompt(
         self,
@@ -438,8 +526,9 @@ Remember: Be decisive but not reckless. Quality over quantity.
         if not kline_data:
             return "【Recent K-line Data】\nNo K-line data available"
 
-        kline_text = "【Recent 10 15-minute K-lines (Most Recent)】\n"
-        for i, kline in enumerate(kline_data[-10:], 1):
+        window = kline_data[-min(len(kline_data), 30):]
+        kline_text = f"【Recent {len(window)} 15-minute K-lines (Most Recent)】\n"
+        for i, kline in enumerate(window, 1):
             candle_type = "🟢 Bullish" if kline['close'] > kline['open'] else "🔴 Bearish"
             change = ((kline['close'] - kline['open']) / kline['open']) * 100
             body_size = abs(kline['close'] - kline['open'])

@@ -64,6 +64,7 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     deepseek_model: str = "deepseek-reasoner"
     deepseek_temperature: float = 0.1
     deepseek_max_retries: int = 2
+    llm_kline_context_bars: int = 10
 
     # Sentiment
     sentiment_enabled: bool = True
@@ -128,9 +129,11 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     orderbook_ema_alpha: float = 0.05
     orderbook_trade_window_sec: int = 300  # 5 minutes
     orderbook_log_interval: int = 60  # log summary every N depth updates
+    orderbook_log_min_seconds: int = 60  # additional wall-clock throttle for OB summary logs
 
     # Timing
     timer_interval_sec: int = 900
+    warmup_bars: int = 200
 
 
 class DeepSeekAIStrategy(Strategy):
@@ -241,7 +244,9 @@ class DeepSeekAIStrategy(Strategy):
                 ema_alpha=config.orderbook_ema_alpha,
                 trade_window_ns=config.orderbook_trade_window_sec * 1_000_000_000,
             )
-            self._ob_log_interval = config.orderbook_log_interval
+            self._ob_log_interval = max(1, int(config.orderbook_log_interval))
+            self._ob_log_min_seconds = max(0, int(config.orderbook_log_min_seconds))
+            self._last_ob_log_ts_ns: Optional[int] = None
 
         # DeepSeek AI analyzer
         api_key = config.deepseek_api_key or os.getenv('DEEPSEEK_API_KEY')
@@ -373,6 +378,7 @@ class DeepSeekAIStrategy(Strategy):
         self.last_signal: Optional[Dict[str, Any]] = None
         self.bars_received = 0
         self.dry_run = os.getenv("DRY_RUN", "false").strip().lower() == "true"
+        self.llm_kline_context_bars = max(10, int(config.llm_kline_context_bars))
 
         self.log.info(f"DeepSeek AI Strategy initialized for {self.instrument_id}")
         if self.dry_run:
@@ -391,8 +397,10 @@ class DeepSeekAIStrategy(Strategy):
 
         self.log.info(f"Loaded instrument: {self.instrument.id}")
 
-        # Pre-fetch historical bars before subscribing to live data
-        self._prefetch_historical_bars(limit=200)
+        # Pre-fetch historical bars before subscribing to live data.
+        # Warmup size is configurable so operators can trade off startup time vs context depth.
+        warmup_limit = max(50, int(self.config.warmup_bars))
+        self._prefetch_historical_bars(limit=warmup_limit)
 
         # Subscribe to bars (live data)
         self.subscribe_bars(self.bar_type)
@@ -641,7 +649,14 @@ class DeepSeekAIStrategy(Strategy):
         self.orderbook_manager.update_from_managed_book(book, ts_event=ts)
 
         n = self.orderbook_manager.depth_updates_received
-        if n == 1 or (self._ob_log_interval and n % self._ob_log_interval == 0):
+        should_log = n == 1 or (self._ob_log_interval and n % self._ob_log_interval == 0)
+        if should_log and self._ob_log_min_seconds > 0 and ts:
+            if self._last_ob_log_ts_ns is not None:
+                min_gap_ns = self._ob_log_min_seconds * 1_000_000_000
+                if (ts - self._last_ob_log_ts_ns) < min_gap_ns:
+                    should_log = False
+
+        if should_log:
             s = self.orderbook_manager.get_summary()
             self.log.info(
                 f"📊 OB #{n}: "
@@ -655,6 +670,8 @@ class DeepSeekAIStrategy(Strategy):
                 f"regime={s.get('depth_regime', '?')} "
                 f"ticks={s.get('trade_ticks', 0)}"
             )
+            if ts:
+                self._last_ob_log_ts_ns = ts
 
     def on_order_book_depth(self, depth) -> None:
         """
@@ -705,8 +722,8 @@ class DeepSeekAIStrategy(Strategy):
             self.log.error(f"Failed to get technical data: {e}")
             return
 
-        # Get K-line data
-        kline_data = self.indicator_manager.get_kline_data(count=10)
+        # Get K-line data for LLM context (configurable depth)
+        kline_data = self.indicator_manager.get_kline_data(count=self.llm_kline_context_bars)
         self.log.debug(f"Retrieved {len(kline_data)} K-lines for analysis")
 
         # Get sentiment data

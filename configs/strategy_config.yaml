@@ -40,6 +40,7 @@ strategy:
     temperature: 0.1
     max_retries: 2
     base_url: "https://api.deepseek.com"
+    kline_context_bars: 20          # Number of recent bars included in LLM analysis context
 
   # Sentiment data
   sentiment:
@@ -115,10 +116,12 @@ strategy:
     feature_buffer_size: 500         # Ring buffer for computed feature vectors
     ema_alpha: 0.05                  # EMA smoothing for feature series
     trade_window_sec: 300            # Rolling trade-flow window (seconds)
-    log_interval: 600                # Log summary every N depth updates (~1/min at 10 updates/sec)
+    log_interval: 600                # Log summary every N depth updates (count-based)
+    log_min_seconds: 60              # Additional wall-clock throttle: max one OB summary per minute
 
   # Timing
-  timer_interval_sec: 900  # 15 minutes for production (reduced API costs and avoid overtrading)
+  timer_interval_sec: 60   # 1-minute decision cycle for active demo iteration
+  warmup_bars: 500         # Historical bars fetched at startup (Bybit API cap: 1000)
 
 # Logging configuration
 logging:

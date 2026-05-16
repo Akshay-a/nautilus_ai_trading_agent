@@ -111,7 +111,7 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
     equity = get_env_float('EQUITY', str(strategy_yaml.get('equity', '400')))
     leverage = get_env_float('LEVERAGE', str(strategy_yaml.get('leverage', '10')))
     base_position = get_env_float('BASE_POSITION_USDT', str(strategy_yaml.get('position_management', {}).get('base_usdt_amount', '30')))
-    timeframe = get_env_str('TIMEFRAME', '15m')  # Production: 15-minute timeframe
+    timeframe = get_env_str('TIMEFRAME', '1m')  # Fast loop default for demo iteration
     instrument_id = get_env_str(
         'INSTRUMENT_ID',
         str(strategy_yaml.get('instrument_id', 'BTCUSDT-LINEAR.BYBIT')),
@@ -180,6 +180,10 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         deepseek_model="deepseek-reasoner",
         deepseek_temperature=0.1,
         deepseek_max_retries=2,
+        llm_kline_context_bars=get_env_int(
+            'LLM_KLINE_CONTEXT_BARS',
+            str(strategy_yaml.get('deepseek', {}).get('kline_context_bars', 10)),
+        ),
 
         # Sentiment
         sentiment_enabled=True,
@@ -207,9 +211,11 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         orderbook_ema_alpha=strategy_yaml.get('orderbook', {}).get('ema_alpha', 0.05),
         orderbook_trade_window_sec=strategy_yaml.get('orderbook', {}).get('trade_window_sec', 300),
         orderbook_log_interval=strategy_yaml.get('orderbook', {}).get('log_interval', 60),
+        orderbook_log_min_seconds=strategy_yaml.get('orderbook', {}).get('log_min_seconds', 60),
 
         # Timing - Load from YAML config (default: 900 seconds = 15 minutes)
         timer_interval_sec=get_env_int('TIMER_INTERVAL_SEC', str(strategy_yaml.get('timer_interval_sec', 900))),
+        warmup_bars=get_env_int('WARMUP_BARS', str(strategy_yaml.get('warmup_bars', 200))),
         
         # Telegram Notifications
         enable_telegram=strategy_yaml.get('telegram', {}).get('enabled', False),

@@ -36,12 +36,14 @@ export BYBIT_TESTNET=false
 export BYBIT_DEMO=true
 export DRY_RUN=false
 export AUTO_CONFIRM=true
+export TIMEFRAME=1m
+export TIMER_INTERVAL_SEC=60
 
 echo "Starting new process in Bybit demo mode..."
 nohup python main_live.py > "logs/trader_$(date +%Y%m%d_%H%M%S).log" 2>&1 &
 echo $! > trader.pid
 
 echo "Trading strategy restarted with PID: $(cat trader.pid)"
-echo "Mode: BYBIT_DEMO=true, BYBIT_TESTNET=false, DRY_RUN=false"
+echo "Mode: BYBIT_DEMO=true, BYBIT_TESTNET=false, DRY_RUN=false, TIMEFRAME=1m, TIMER_INTERVAL_SEC=60"
 echo "View logs: tail -f logs/trader_*.log"
 echo "Stop trader: ./stop_trader.sh"

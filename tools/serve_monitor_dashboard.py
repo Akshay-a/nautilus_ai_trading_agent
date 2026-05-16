@@ -41,13 +41,18 @@ RE_POSITION_OPENED = re.compile(
 )
 RE_POSITION_CLOSED = re.compile(r"🔴 Position closed:\s*(LONG|SHORT)\s*P&L:\s*([+-]?[0-9.]+)\s*USDT")
 RE_WARMUP = re.compile(r"Received\s+([0-9]+)\s+warmup bars")
+RE_POSITION_NET = re.compile(r"net_position=([+-]?[0-9]+(?:\.[0-9]+)?)")
+RE_POSITION_AVG = re.compile(r"Position avg_px verified .*internal=([0-9]+(?:\.[0-9]+)?)")
+RE_LLM_PROMPT_PAYLOAD = re.compile(r"🤖 LLM Prompt Payload:\s*(\{.*\})$")
+RE_LLM_RESPONSE_JSON = re.compile(r"🤖 LLM Response JSON:\s*(\{.*\})$")
+RE_LLM_RAW_RESPONSE = re.compile(r"🤖 DeepSeek Raw Response:\s*(.+)", re.DOTALL)
 
 
 @dataclass
 class PositionState:
     side: str
     quantity: float
-    entry_price: float
+    entry_price: Optional[float]
 
 
 def _latest_json_log() -> Optional[Path]:
@@ -118,7 +123,21 @@ def _strategy_process_state() -> Dict[str, Any]:
     return {"running": running, "pid": pid}
 
 
-def _session_log_files() -> List[Path]:
+def _session_base_name(path_str: str) -> str:
+    """
+    Normalize rotated and non-rotated log path into one session key.
+
+    Examples:
+    - deepseek_trader_x.json   -> deepseek_trader_x.json
+    - deepseek_trader_x.json.1 -> deepseek_trader_x.json
+    """
+    p = Path(path_str)
+    if p.suffix.lstrip(".").isdigit():
+        return str(p.with_suffix(""))
+    return str(p)
+
+
+def _session_log_files(target_pid: Optional[int] = None) -> List[Path]:
     """
     Return all log files for the current session, oldest → newest.
 
@@ -133,32 +152,39 @@ def _session_log_files() -> List[Path]:
     if not candidates:
         return []
 
-    # Group by base name (strip the trailing .N suffix if present)
-    # and find the session that was most recently modified
-    by_mtime = sorted(candidates, key=lambda p: os.path.getmtime(p), reverse=True)
-    if not by_mtime:
-        return []
+    sessions: Dict[str, List[str]] = {}
+    for p in candidates:
+        key = _session_base_name(p)
+        sessions.setdefault(key, []).append(p)
 
-    # The newest file tells us the active base name
-    newest = by_mtime[0]
-    base = newest
-    # Strip .N suffix to get the base log filename
-    for part in by_mtime:
-        if not part.endswith((".1", ".2", ".3")):
-            base = part
-            break
+    def _sorted_session_files(files: List[str]) -> List[Path]:
+        files = sorted(files, key=lambda p: os.path.getmtime(p))
+        return [Path(p) for p in files]
 
-    base_path = Path(base)
-    # Remove .json extension then add back to build the pattern
-    stem = base_path.stem  # e.g. deepseek_trader_2026-05-16_095345:520
-    session_files = [p for p in candidates if Path(p).stem == stem or Path(p).name.startswith(base_path.name)]
+    # If we know active PID, pin to the session whose startup banner includes that PID.
+    if target_pid is not None:
+        pid_token = f"PID: {target_pid}"
+        for files in sessions.values():
+            for f in _sorted_session_files(files):
+                try:
+                    with f.open("r", encoding="utf-8", errors="replace") as fh:
+                        for idx, line in enumerate(fh):
+                            if pid_token in line:
+                                return _sorted_session_files(files)
+                            if idx > 1200:
+                                break
+                except Exception:
+                    continue
 
-    # Sort oldest → newest (backup .1 is older than current .json)
-    session_files.sort(key=lambda p: os.path.getmtime(p))
-    return [Path(p) for p in session_files]
+    # Fallback: newest session by latest file mtime.
+    newest_session = max(
+        sessions.values(),
+        key=lambda files: max(os.path.getmtime(p) for p in files),
+    )
+    return _sorted_session_files(newest_session)
 
 
-def _parse_log_metrics(log_path: Optional[Path]) -> Dict[str, Any]:
+def _parse_log_metrics(log_path: Optional[Path], target_pid: Optional[int] = None) -> Dict[str, Any]:
     metrics: Dict[str, Any] = {
         "log_file": str(log_path) if log_path else None,
         "log_timestamp_utc": None,
@@ -179,10 +205,11 @@ def _parse_log_metrics(log_path: Optional[Path]) -> Dict[str, Any]:
         "dry_run_events": 0,
         "recent_events": [],
         "recent_warnings_errors": [],
+        "llm_conversations": [],
     }
 
     # Read all rotated files for this session in chronological order
-    all_files = _session_log_files()
+    all_files = _session_log_files(target_pid=target_pid)
     if not all_files:
         if log_path is not None and log_path.exists():
             all_files = [log_path]
@@ -192,6 +219,8 @@ def _parse_log_metrics(log_path: Optional[Path]) -> Dict[str, Any]:
     metrics["log_file"] = str(all_files[-1])  # show active file in UI
 
     position: Optional[PositionState] = None
+    last_reconciled_avg_px: Optional[float] = None
+    pending_prompt: Optional[Dict[str, Any]] = None
 
     for file_path in all_files:
         if not file_path.exists():
@@ -244,6 +273,15 @@ def _parse_log_metrics(log_path: Optional[Path]) -> Dict[str, Any]:
                     metrics["last_signal"] = {"signal": signal, "confidence": confidence}
                     metrics["last_signal_api_sec"] = float(api_sec)
                     metrics["last_signal_reason"] = reason.strip()
+                    if not metrics["llm_conversations"] or metrics["llm_conversations"][-1].get("signal"):
+                        metrics["llm_conversations"].append(
+                            {"ts_prompt": None, "prompt_payload": None, "ts_response": ts}
+                        )
+                    metrics["llm_conversations"][-1]["signal"] = metrics["last_signal"]
+                    metrics["llm_conversations"][-1]["api_time_sec"] = metrics["last_signal_api_sec"]
+                    metrics["llm_conversations"][-1]["reason"] = metrics["last_signal_reason"]
+                    if len(metrics["llm_conversations"]) > 12:
+                        metrics["llm_conversations"] = metrics["llm_conversations"][-12:]
 
                 if "DRY RUN" in msg:
                     metrics["dry_run_events"] += 1
@@ -266,12 +304,66 @@ def _parse_log_metrics(log_path: Optional[Path]) -> Dict[str, Any]:
                         entry_price=float(entry_px),
                     )
 
+                m_pos_net = RE_POSITION_NET.search(msg)
+                if m_pos_net:
+                    net_qty = float(m_pos_net.group(1))
+                    if net_qty == 0:
+                        position = None
+                    else:
+                        position = PositionState(
+                            side="LONG" if net_qty > 0 else "SHORT",
+                            quantity=abs(net_qty),
+                            entry_price=last_reconciled_avg_px,
+                        )
+
+                m_pos_avg = RE_POSITION_AVG.search(msg)
+                if m_pos_avg:
+                    last_reconciled_avg_px = float(m_pos_avg.group(1))
+                    if position is not None:
+                        position.entry_price = last_reconciled_avg_px
+
                 m_pos_closed = RE_POSITION_CLOSED.search(msg)
                 if m_pos_closed:
                     _, pnl = m_pos_closed.groups()
                     metrics["closed_trades"] += 1
                     metrics["realized_pnl_usdt"] += float(pnl)
                     position = None
+
+                m_prompt = RE_LLM_PROMPT_PAYLOAD.search(msg)
+                if m_prompt:
+                    try:
+                        payload = json.loads(m_prompt.group(1))
+                    except json.JSONDecodeError:
+                        payload = {"raw": m_prompt.group(1)}
+                    pending_prompt = {
+                        "ts_prompt": ts,
+                        "prompt_payload": payload,
+                    }
+
+                m_resp_json = RE_LLM_RESPONSE_JSON.search(msg)
+                if m_resp_json:
+                    try:
+                        resp_json = json.loads(m_resp_json.group(1))
+                    except json.JSONDecodeError:
+                        resp_json = {"raw": m_resp_json.group(1)}
+                    convo = pending_prompt or {"ts_prompt": None, "prompt_payload": None}
+                    convo["ts_response"] = ts
+                    convo["response_json"] = resp_json
+                    metrics["llm_conversations"].append(convo)
+                    pending_prompt = None
+                    if len(metrics["llm_conversations"]) > 12:
+                        metrics["llm_conversations"] = metrics["llm_conversations"][-12:]
+
+                m_resp_raw = RE_LLM_RAW_RESPONSE.search(msg)
+                if m_resp_raw:
+                    if not metrics["llm_conversations"] or metrics["llm_conversations"][-1].get("response_raw"):
+                        convo = pending_prompt or {"ts_prompt": None, "prompt_payload": None}
+                        convo["ts_response"] = ts
+                        metrics["llm_conversations"].append(convo)
+                        pending_prompt = None
+                    metrics["llm_conversations"][-1]["response_raw"] = m_resp_raw.group(1)
+                    if len(metrics["llm_conversations"]) > 12:
+                        metrics["llm_conversations"] = metrics["llm_conversations"][-12:]
 
                 important = (
                     "Signal:" in msg
@@ -306,7 +398,7 @@ def collect_status() -> Dict[str, Any]:
     env_cfg = _parse_env_file(ENV_FILE)
     log_path = _latest_json_log()  # still used as fallback
     proc = _strategy_process_state()
-    metrics = _parse_log_metrics(log_path)  # _parse_log_metrics calls _session_log_files internally
+    metrics = _parse_log_metrics(log_path, target_pid=proc.get("pid"))
 
     now_utc = datetime.now(timezone.utc).isoformat()
     mode = {
@@ -333,7 +425,8 @@ def _render_html(status: Dict[str, Any]) -> str:
     pos = m["open_position"]
 
     pos_html = (
-        f"<b>{pos['side']}</b> {pos['quantity']:.6f} BTC @ ${pos['entry_price']:,.2f}"
+        f"<b>{pos['side']}</b> {pos['quantity']:.6f} BTC"
+        + (f" @ ${pos['entry_price']:,.2f}" if isinstance(pos.get("entry_price"), (int, float)) else "")
         if pos
         else "No open position"
     )
@@ -430,6 +523,11 @@ def _render_html(status: Dict[str, Any]) -> str:
     </div>
 
     <div class="card" style="margin-top:12px">
+      <div class="k">LLM Conversation (Recent)</div>
+      <div id="llm_convos" class="small"></div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
       <div class="small">
         API endpoint: <code>/api/status</code><br>
         Source log: <code>{m["log_file"] or "N/A"}</code>
@@ -440,10 +538,24 @@ def _render_html(status: Dict[str, Any]) -> str:
     const status = {json.dumps(status)};
     const warns = status.metrics.recent_warnings_errors || [];
     const events = status.metrics.recent_events || [];
+    const llmConvos = status.metrics.llm_conversations || [];
     const warnList = document.getElementById("warns");
     const eventList = document.getElementById("events");
+    const llmConvosEl = document.getElementById("llm_convos");
     warnList.innerHTML = warns.slice(-8).reverse().map(x => `<li>[${{x.level}}] ${{x.message}}</li>`).join("") || "<li>None</li>";
     eventList.innerHTML = events.slice(-8).reverse().map(x => `<li>${{x.message}}</li>`).join("") || "<li>None</li>";
+    llmConvosEl.innerHTML = llmConvos.slice(-5).reverse().map(c => {{
+      const prompt = c.prompt_payload ? JSON.stringify(c.prompt_payload) : "N/A";
+      const response = c.response_json ? JSON.stringify(c.response_json) : (c.response_raw || "N/A");
+      const signal = c.signal ? `${{c.signal.signal}} (${{c.signal.confidence}})` : "N/A";
+      return `
+        <div style="border:1px solid #e5e7eb; border-radius:8px; padding:8px; margin:8px 0;">
+          <div><b>Signal:</b> ${{signal}} | <b>API:</b> ${{c.api_time_sec ?? "N/A"}}s</div>
+          <div><b>Prompt payload:</b> <code>${{prompt}}</code></div>
+          <div><b>Response:</b> <code>${{response}}</code></div>
+        </div>
+      `;
+    }}).join("") || "<div>None</div>";
   </script>
 </body>
 </html>
