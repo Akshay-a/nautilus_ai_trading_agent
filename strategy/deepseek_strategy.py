@@ -642,15 +642,18 @@ class DeepSeekAIStrategy(Strategy):
 
         n = self.orderbook_manager.depth_updates_received
         if n == 1 or (self._ob_log_interval and n % self._ob_log_interval == 0):
-            summary = self.orderbook_manager.get_summary()
+            s = self.orderbook_manager.get_summary()
             self.log.info(
-                f"📊 OrderBook #{n}: "
-                f"bid={summary.get('best_bid', 0):.2f} "
-                f"ask={summary.get('best_ask', 0):.2f} "
-                f"spread={summary.get('spread_bps', 0):.1f}bps "
-                f"tob_imb={summary.get('tob_imbalance', 0):+.3f} "
-                f"ofi={summary.get('ema_ofi', 0):+.4f} "
-                f"trades={summary.get('trade_ticks', 0)}"
+                f"📊 OB #{n}: "
+                f"bid={s.get('best_bid', 0):.2f} ask={s.get('best_ask', 0):.2f} "
+                f"spr={s.get('spread_bps', 0):.1f}bps "
+                f"tob={s.get('tob_imbalance', 0):+.3f} "
+                f"ofi={s.get('ema_ofi', 0):+.4f} "
+                f"qp={s.get('queue_pressure', 0):+.3f} "
+                f"tf={s.get('trade_flow_imbalance', 0):+.3f} "
+                f"sw_b={s.get('sweep_buy_count', 0)} sw_s={s.get('sweep_sell_count', 0)} "
+                f"regime={s.get('depth_regime', '?')} "
+                f"ticks={s.get('trade_ticks', 0)}"
             )
 
     def on_order_book_depth(self, depth) -> None:
@@ -742,15 +745,31 @@ class DeepSeekAIStrategy(Strategy):
         self.log.info(f"Overall Trend: {technical_data.get('overall_trend', 'N/A')}")
         self.log.info(f"RSI: {technical_data.get('rsi', 0):.2f}")
         if microstructure_data:
+            ms = microstructure_data
             self.log.info(
                 f"📊 Microstructure: "
-                f"spread={microstructure_data.get('spread_bps', 0):.1f}bps "
-                f"microprice={microstructure_data.get('microprice', 0):.2f} "
-                f"tob_imb={microstructure_data.get('tob_imbalance', 0):+.3f} "
-                f"depth_imb={microstructure_data.get('depth_imbalance', 0):+.3f} "
-                f"ofi={microstructure_data.get('ema_ofi', 0):+.4f} "
-                f"tf_imb={microstructure_data.get('trade_flow_imbalance', 0):+.3f}"
+                f"spr={ms.get('spread_bps', 0):.1f}bps "
+                f"spr_vol={ms.get('spread_volatility', 0):.3f} "
+                f"μpx={ms.get('microprice', 0):.2f} "
+                f"tob={ms.get('tob_imbalance', 0):+.3f} "
+                f"depth={ms.get('depth_imbalance', 0):+.3f} "
+                f"ofi={ms.get('ema_ofi', 0):+.4f} "
+                f"qp={ms.get('queue_pressure', 0):+.3f} "
+                f"tf={ms.get('trade_flow_imbalance', 0):+.3f} "
+                f"vwap_dev={ms.get('vwap_deviation_bps', 0):+.1f}bps "
+                f"sw={ms.get('sweep_buy_count', 0)}B/{ms.get('sweep_sell_count', 0)}S "
+                f"regime={ms.get('depth_regime', '?')}"
             )
+            # Periodic feature dump to CSV for offline IC analysis
+            try:
+                dump_path = self.orderbook_manager.dump_features_csv(
+                    path="data/microstructure_features.csv",
+                    fwd_bars=(1, 5),
+                )
+                if dump_path:
+                    self.log.info(f"📁 Feature dump: {dump_path} ({self.orderbook_manager.depth_updates_received} rows)")
+            except Exception as e:
+                self.log.warning(f"Feature dump failed: {e}")
         if current_position:
             self.log.info(
                 f"Current Position: {current_position['side']} "
