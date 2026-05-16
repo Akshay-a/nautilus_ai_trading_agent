@@ -1,60 +1,47 @@
 #!/bin/bash
+set -euo pipefail
 
-# DeepSeek Trading Strategy Restart Script
+# DeepSeek Trading Strategy Restart Script (Bybit Demo Paper Trading)
 
-cd /home/ubuntu/nautilus_deepseek
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
-echo "🔄 Restarting trading strategy..."
+echo "Restarting trading strategy..."
 
-# 先停止（如果正在运行）
+# Stop prior process (if any)
 if [ -f trader.pid ]; then
-    PID=$(cat trader.pid)
-    if ps -p $PID > /dev/null 2>&1; then
-        echo "🛑 Stopping existing process (PID: $PID)..."
-        kill $PID
-        sleep 3
-        
-        # 强制终止（如果还在运行）
-        if ps -p $PID > /dev/null 2>&1; then
-            echo "⚠️  Process still running, forcing termination..."
-            kill -9 $PID
-            sleep 1
-        fi
-        
-        rm trader.pid
-        echo "✅ Process stopped"
-    else
-        echo "⚠️  Process not running (PID: $PID)"
-        rm trader.pid
-    fi
-else
-    echo "ℹ️  No PID file found, checking for running processes..."
-    # 查找并停止所有 main_live.py 进程
-    pkill -f "main_live.py"
+  PID="$(cat trader.pid)"
+  if ps -p "$PID" > /dev/null 2>&1; then
+    echo "Stopping existing process (PID: $PID)..."
+    kill "$PID"
     sleep 2
+  fi
+  rm -f trader.pid
 fi
 
-# 确保没有残留进程
-if pgrep -f "main_live.py" > /dev/null; then
-    echo "⚠️  Found running processes, killing them..."
-    pkill -9 -f "main_live.py"
-    sleep 1
+# Fallback process cleanup
+pkill -f "python.*main_live.py" >/dev/null 2>&1 || true
+sleep 1
+
+# Activate project virtualenv if available
+if [ -f "venv/bin/activate" ]; then
+  # shellcheck disable=SC1091
+  source "venv/bin/activate"
 fi
 
-# 激活虚拟环境
-source /home/ubuntu/deepseek_venv/bin/activate
-
-# 创建日志目录
 mkdir -p logs
 
-# 启动新进程（直接在命令行设置环境变量）
-echo "🚀 Starting new process..."
-AUTO_CONFIRM=true EQUITY=400 nohup python main_live.py > logs/trader_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+# Safety defaults: force Bybit demo environment (no real money)
+export BYBIT_TESTNET=false
+export BYBIT_DEMO=true
+export DRY_RUN=false
+export AUTO_CONFIRM=true
 
-# 保存 PID
+echo "Starting new process in Bybit demo mode..."
+nohup python main_live.py > "logs/trader_$(date +%Y%m%d_%H%M%S).log" 2>&1 &
 echo $! > trader.pid
 
-echo "✅ Trading strategy restarted with PID: $(cat trader.pid)"
-echo "📋 View logs: tail -f logs/trader_*.log"
-echo "🛑 Stop trader: kill $(cat trader.pid)"
-
+echo "Trading strategy restarted with PID: $(cat trader.pid)"
+echo "Mode: BYBIT_DEMO=true, BYBIT_TESTNET=false, DRY_RUN=false"
+echo "View logs: tail -f logs/trader_*.log"
+echo "Stop trader: ./stop_trader.sh"

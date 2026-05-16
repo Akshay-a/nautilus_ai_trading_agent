@@ -2,6 +2,29 @@
 
 Utility scripts for monitoring and managing the DeepSeek AI Trading Strategy.
 
+## Web Dashboard (Recommended)
+
+### serve_monitor_dashboard.py
+Live HTTP dashboard powered by existing `logs/deepseek_trader_*.json` messages.
+
+**Usage:**
+```bash
+python tools/serve_monitor_dashboard.py --host 0.0.0.0 --port 8787
+```
+
+**Endpoints:**
+- `/` dashboard UI
+- `/api/status` JSON snapshot
+
+**Shows:**
+- Process status / PID
+- Safety mode flags (`BYBIT_DEMO`, `BYBIT_TESTNET`, `DRY_RUN`)
+- Last price / trend / RSI
+- Last LLM signal + confidence + API latency
+- Open position (if present in logs)
+- Closed trades and realized P&L (session log)
+- Recent warnings/errors and important events
+
 ## Emulated Order Monitoring
 
 ### monitor_emulated_orders.sh

@@ -1,27 +1,29 @@
 #!/bin/bash
+set -euo pipefail
 
-# DeepSeek Trading Strategy Startup Script
+# DeepSeek Trading Strategy Startup Script (Bybit Demo Paper Trading)
 
-# 设置工作目录
-cd /home/ubuntu/nautilus_deepseek
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
-# 激活虚拟环境
-source /home/ubuntu/deepseek_venv/bin/activate
+# Activate project virtualenv if available
+if [ -f "venv/bin/activate" ]; then
+  # shellcheck disable=SC1091
+  source "venv/bin/activate"
+fi
 
-# 设置环境变量（用于 systemd/supervisor）
+# Safety defaults: force Bybit demo environment (no real money)
+export BYBIT_TESTNET=false
+export BYBIT_DEMO=true
+export DRY_RUN=false
 export AUTO_CONFIRM=true
-export EQUITY=400  # 实际账户余额
 
-# 创建日志目录
 mkdir -p logs
 
-# 运行策略（后台运行）
-nohup python main_live.py > logs/trader_$(date +%Y%m%d_%H%M%S).log 2>&1 &
-
-# 保存 PID
+nohup python main_live.py > "logs/trader_$(date +%Y%m%d_%H%M%S).log" 2>&1 &
 echo $! > trader.pid
 
-echo "✅ Trading strategy started with PID: $(cat trader.pid)"
-echo "📋 View logs: tail -f logs/trader_*.log"
-echo "🛑 Stop trader: kill $(cat trader.pid)"
-
+echo "Trading strategy started with PID: $(cat trader.pid)"
+echo "Mode: BYBIT_DEMO=true, BYBIT_TESTNET=false, DRY_RUN=false"
+echo "View logs: tail -f logs/trader_*.log"
+echo "Stop trader: ./stop_trader.sh"

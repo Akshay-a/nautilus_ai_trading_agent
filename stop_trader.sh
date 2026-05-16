@@ -25,3 +25,14 @@ else
     echo "❌ No PID file found. Is the trader running?"
 fi
 
+# Also stop local dashboard if running
+if [ -f dashboard.pid ]; then
+    DASH_PID=$(cat dashboard.pid)
+    if ps -p "$DASH_PID" > /dev/null 2>&1; then
+        echo "🛑 Stopping dashboard (PID: $DASH_PID)..."
+        kill "$DASH_PID"
+        sleep 1
+    fi
+    rm -f dashboard.pid
+    echo "✅ Dashboard stopped"
+fi
