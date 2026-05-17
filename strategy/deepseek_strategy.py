@@ -260,6 +260,8 @@ class DeepSeekAIStrategy(Strategy):
             model=config.deepseek_model,
             temperature=config.deepseek_temperature,
             max_retries=config.deepseek_max_retries,
+            instrument_id=str(self.instrument_id),
+            bar_type=str(self.bar_type),
             nautilus_logger=self.log,
         )
         
@@ -752,6 +754,8 @@ class DeepSeekAIStrategy(Strategy):
             'volume': float(current_bar.volume),
             'price_change': self._calculate_price_change(),
             'kline_data': kline_data,
+            'instrument_id': str(self.instrument_id),
+            'bar_type': str(self.bar_type),
         }
         if microstructure_data:
             price_data['microstructure'] = microstructure_data

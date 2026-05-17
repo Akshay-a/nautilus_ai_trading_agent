@@ -1,0 +1,57 @@
+{
+  "run_id": "btc15m_native_backtest_90d",
+  "generated_at_utc": "2026-05-17T09:32:53.637270Z",
+  "catalog_path": "/Users/akshayapsingi/Projects/nautilus_ai_trading_agent/data/catalog_90d",
+  "bar_type": "BTCUSDT-LINEAR.BYBIT-15-MINUTE-LAST-EXTERNAL",
+  "coverage": {
+    "bars": 8641,
+    "start_utc": "2026-02-16T00:00:00Z",
+    "end_utc": "2026-05-17T00:00:00Z",
+    "expected_bars": 8641,
+    "missing_intervals": 0,
+    "missing_samples_utc": [],
+    "coverage_days": 90.0
+  },
+  "split": {
+    "train_ratio": 0.7,
+    "windows": [
+      {
+        "name": "in_sample",
+        "start_utc": "2026-02-16T00:00:00Z",
+        "end_utc": "2026-04-20T00:00:00Z"
+      },
+      {
+        "name": "out_of_sample",
+        "start_utc": "2026-04-20T00:00:00Z",
+        "end_utc": "2026-05-17T00:00:00Z"
+      }
+    ]
+  },
+  "assumptions": {
+    "maker_fee": 0.0002,
+    "taker_fee": 0.00055,
+    "slippage_bps_baseline": 1,
+    "slippage_bps_sensitivity": [
+      2,
+      5
+    ],
+    "funding_rate_available": false,
+    "funding_rate_assumption": "Funding costs excluded (historical funding series not provided in this dataset)."
+  },
+  "determinism": {
+    "metrics_hash": "600621478ab4f8d1403ceab9454880c305f5848053b894b654d64ea6ee7b236e",
+    "hash_reproducible": true
+  },
+  "viability_verdict": "KILL",
+  "warnings": [
+    "Provisional results: coverage is 90.0 days, below 6.0 month target",
+    "Suspicious Sharpe magnitude (>5) detected",
+    "Too few trades (<5) for stable inference"
+  ],
+  "skipped_variants": [
+    {
+      "variant": "recorded_llm_replay",
+      "reason": "No replay decisions in in_sample window"
+    }
+  ]
+}

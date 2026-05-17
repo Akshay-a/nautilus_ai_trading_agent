@@ -125,8 +125,9 @@ class OrderBookManager:
     SWEEP_SIZE_MULT = 5.0
     SWEEP_LOOKBACK = 200
 
-    # Queue pressure: depth within this fraction of best price
-    QUEUE_PRESSURE_BPS = 10  # 0.10 %
+    # Queue pressure: near-touch depth window
+    QUEUE_PRESSURE_BPS = 10  # 0.10%
+    QUEUE_PRESSURE_MAX_LEVELS = 3  # hard cap to avoid collapsing to full-depth imbalance
 
     # Spread volatility rolling window (in depth updates, not nanos)
     SPREAD_VOL_WINDOW = 60
@@ -322,20 +323,24 @@ class OrderBookManager:
         # Queue pressure: depth within QUEUE_PRESSURE_BPS of best price
         queue_pressure = self._compute_queue_pressure(snap, best_bid, best_ask)
 
-        # Trade flow
-        buy_vol, sell_vol, buy_cnt, sell_cnt = self._trade_flow_in_window(
-            snap.ts_event
-        )
+        # Trade flow / sweep / vwap (single pass over trade window)
+        (
+            buy_vol,
+            sell_vol,
+            buy_cnt,
+            sell_cnt,
+            sb_cnt,
+            ss_cnt,
+            sb_vol,
+            ss_vol,
+            recent_vwap,
+        ) = self._compute_trade_window_features(snap.ts_event)
         tf_total = buy_vol + sell_vol
         trade_flow_imbalance = (
             (buy_vol - sell_vol) / tf_total if tf_total > 0 else 0.0
         )
 
-        # Sweep detection
-        sb_cnt, ss_cnt, sb_vol, ss_vol = self._detect_sweeps(snap.ts_event)
-
         # VWAP deviation
-        recent_vwap = self._recent_vwap(snap.ts_event)
         vwap_deviation_bps = (
             (mid - recent_vwap) / mid * 10_000 if mid > 0 and recent_vwap > 0
             else 0.0
@@ -417,11 +422,15 @@ class OrderBookManager:
         """
         threshold = self.QUEUE_PRESSURE_BPS / 10_000
         bid_near = 0.0
-        for px, sz in zip(snap.bid_prices, snap.bid_sizes):
+        for i, (px, sz) in enumerate(zip(snap.bid_prices, snap.bid_sizes)):
+            if i >= self.QUEUE_PRESSURE_MAX_LEVELS:
+                break
             if best_bid > 0 and (best_bid - px) / best_bid <= threshold:
                 bid_near += sz
         ask_near = 0.0
-        for px, sz in zip(snap.ask_prices, snap.ask_sizes):
+        for i, (px, sz) in enumerate(zip(snap.ask_prices, snap.ask_sizes)):
+            if i >= self.QUEUE_PRESSURE_MAX_LEVELS:
+                break
             if best_ask > 0 and (px - best_ask) / best_ask <= threshold:
                 ask_near += sz
         total = bid_near + ask_near
@@ -429,24 +438,16 @@ class OrderBookManager:
 
     # -- 2c helpers --
 
-    def _trade_flow_in_window(self, now_ns: int):
-        cutoff = now_ns - self._trade_window_ns
-        bv = sv = 0.0
-        bc = sc = 0
-        for t in reversed(self._trade_buf):
-            if t.ts_event < cutoff:
-                break
-            if t.is_buyer_aggressor:
-                bv += t.size; bc += 1
-            else:
-                sv += t.size; sc += 1
-        return bv, sv, bc, sc
-
-    def _detect_sweeps(self, now_ns: int) -> Tuple[int, int, float, float]:
+    def _compute_trade_window_features(
+        self, now_ns: int
+    ) -> Tuple[float, float, int, int, int, int, float, float, float]:
         """
-        A *sweep* is a single trade whose size exceeds
-        SWEEP_SIZE_MULT × rolling median trade size.
-        Returns (buy_count, sell_count, buy_volume, sell_volume) in window.
+        Compute trade-window features in one traversal.
+
+        Returns:
+            buy_vol, sell_vol, buy_count, sell_count,
+            sweep_buy_count, sweep_sell_count, sweep_buy_vol, sweep_sell_vol,
+            recent_vwap
         """
         cutoff = now_ns - self._trade_window_ns
         recent: List[TradeRecord] = []
@@ -455,34 +456,57 @@ class OrderBookManager:
                 break
             recent.append(t)
 
-        if len(recent) < 10:
-            return 0, 0, 0.0, 0.0
+        if not recent:
+            return 0.0, 0.0, 0, 0, 0, 0, 0.0, 0.0, 0.0
 
-        sizes = sorted(r.size for r in recent[-self.SWEEP_LOOKBACK:])
-        median_sz = sizes[len(sizes) // 2] if sizes else 0.0
-        threshold = median_sz * self.SWEEP_SIZE_MULT
+        buy_vol = sell_vol = 0.0
+        buy_count = sell_count = 0
+        notional = volume = 0.0
 
-        sb_cnt = ss_cnt = 0
-        sb_vol = ss_vol = 0.0
         for t in recent:
-            if t.size >= threshold:
-                if t.is_buyer_aggressor:
-                    sb_cnt += 1; sb_vol += t.size
-                else:
-                    ss_cnt += 1; ss_vol += t.size
-        return sb_cnt, ss_cnt, sb_vol, ss_vol
-
-    def _recent_vwap(self, now_ns: int) -> float:
-        """Volume-weighted average price over the trade window."""
-        cutoff = now_ns - self._trade_window_ns
-        notional = 0.0
-        volume = 0.0
-        for t in reversed(self._trade_buf):
-            if t.ts_event < cutoff:
-                break
             notional += t.price * t.size
             volume += t.size
-        return notional / volume if volume > 0 else 0.0
+            if t.is_buyer_aggressor:
+                buy_vol += t.size
+                buy_count += 1
+            else:
+                sell_vol += t.size
+                sell_count += 1
+
+        # Use the most recent SWEEP_LOOKBACK trades for robust thresholding.
+        # `recent` is newest-first because we iterated reversed(self._trade_buf).
+        sweep_sample = recent[: self.SWEEP_LOOKBACK]
+        if len(sweep_sample) < 10:
+            recent_vwap = notional / volume if volume > 0 else 0.0
+            return buy_vol, sell_vol, buy_count, sell_count, 0, 0, 0.0, 0.0, recent_vwap
+
+        median_sz = statistics.median(t.size for t in sweep_sample)
+        threshold = median_sz * self.SWEEP_SIZE_MULT
+
+        sweep_buy_count = sweep_sell_count = 0
+        sweep_buy_vol = sweep_sell_vol = 0.0
+        for t in recent:
+            if t.size < threshold:
+                continue
+            if t.is_buyer_aggressor:
+                sweep_buy_count += 1
+                sweep_buy_vol += t.size
+            else:
+                sweep_sell_count += 1
+                sweep_sell_vol += t.size
+
+        recent_vwap = notional / volume if volume > 0 else 0.0
+        return (
+            buy_vol,
+            sell_vol,
+            buy_count,
+            sell_count,
+            sweep_buy_count,
+            sweep_sell_count,
+            sweep_buy_vol,
+            sweep_sell_vol,
+            recent_vwap,
+        )
 
     def _classify_depth_regime(self, total_depth: float) -> str:
         """
@@ -723,8 +747,15 @@ class OrderBookManager:
         def _rank(vals):
             indexed = sorted(range(len(vals)), key=lambda i: vals[i])
             ranks = [0.0] * len(vals)
-            for rank, idx in enumerate(indexed):
-                ranks[idx] = float(rank)
+            i = 0
+            while i < len(indexed):
+                j = i
+                while j + 1 < len(indexed) and vals[indexed[j + 1]] == vals[indexed[i]]:
+                    j += 1
+                avg_rank = (i + j) / 2.0
+                for k in range(i, j + 1):
+                    ranks[indexed[k]] = avg_rank
+                i = j + 1
             return ranks
 
         def _spearman(xs, ys):
@@ -748,10 +779,12 @@ class OrderBookManager:
 
         ic_table = []
         best_abs_ic: Dict[str, float] = {}
+        ret_series = {ret_col: [_to_float(r.get(ret_col)) for r in rows] for ret_col in return_cols}
+
         for feat in feature_cols:
             feat_vals = [_to_float(r.get(feat)) for r in rows]
             for ret_col in return_cols:
-                ret_vals = [_to_float(r.get(ret_col)) for r in rows]
+                ret_vals = ret_series[ret_col]
                 ic = _spearman(feat_vals, ret_vals)
                 abs_ic = abs(ic)
                 ic_table.append({

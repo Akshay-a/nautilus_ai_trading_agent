@@ -28,6 +28,8 @@ class DeepSeekAnalyzer:
         temperature: float = 0.1,
         base_url: str = "https://api.deepseek.com",
         max_retries: int = 2,
+        instrument_id: str = "",
+        bar_type: str = "",
         nautilus_logger=None,
     ):
         """
@@ -45,6 +47,10 @@ class DeepSeekAnalyzer:
             API base URL
         max_retries : int
             Maximum retry attempts on failure
+        instrument_id : str
+            Active trading instrument id (e.g. ETHUSDT-LINEAR.BYBIT)
+        bar_type : str
+            Active bar type string for timeframe context
         nautilus_logger : optional
             NautilusTrader logger instance (self.log from Strategy) to route
             errors/warnings into the JSON log file. Falls back to standard
@@ -61,6 +67,98 @@ class DeepSeekAnalyzer:
 
         # Track signal history
         self.signal_history = []
+        self._context_key = None
+        self._set_instrument_context(instrument_id=instrument_id, bar_type=bar_type, reset_history=False)
+
+    def _derive_timeframe_label(self, bar_type: str) -> str:
+        """Build readable timeframe label from Nautilus bar_type."""
+        if not bar_type:
+            return "15-minute"
+        text = bar_type.upper()
+        m = re.search(r"-([0-9]+)-(MINUTE|HOUR|DAY)-", text)
+        if not m:
+            return "15-minute"
+        qty = int(m.group(1))
+        unit = m.group(2).lower()
+        return f"{qty}-{unit}"
+
+    def _build_instrument_context(self, instrument_id: str, bar_type: str) -> Dict[str, str]:
+        """Extract pair/venue/unit metadata from instrument_id and bar_type."""
+        instr = str(instrument_id or "UNKNOWNUSDT-LINEAR.UNKNOWN")
+        symbol = instr.split("-")[0] if "-" in instr else instr.split(".")[0]
+        venue = instr.split(".")[-1] if "." in instr else "UNKNOWN"
+
+        quote = ""
+        base = symbol
+        for candidate in ("USDT", "USDC", "USD", "BTC", "ETH", "EUR"):
+            if symbol.endswith(candidate) and len(symbol) > len(candidate):
+                quote = candidate
+                base = symbol[:-len(candidate)]
+                break
+
+        pair_label = f"{base}/{quote}" if quote else symbol
+        timeframe_label = self._derive_timeframe_label(bar_type)
+        return {
+            "instrument_id": instr,
+            "bar_type": str(bar_type or ""),
+            "venue": venue,
+            "symbol": symbol,
+            "base_asset": base,
+            "quote_asset": quote or "QUOTE",
+            "pair_label": pair_label,
+            "timeframe_label": timeframe_label,
+        }
+
+    def _set_instrument_context(
+        self,
+        instrument_id: str,
+        bar_type: str,
+        reset_history: bool,
+    ) -> None:
+        """Set active prompt context and optionally clear stale signal history."""
+        ctx = self._build_instrument_context(instrument_id=instrument_id, bar_type=bar_type)
+        new_key = (ctx["instrument_id"], ctx["bar_type"])
+        previous_key = self._context_key
+        changed = previous_key is not None and previous_key != new_key
+
+        self.instrument_id = ctx["instrument_id"]
+        self.bar_type = ctx["bar_type"]
+        self.venue = ctx["venue"]
+        self.symbol = ctx["symbol"]
+        self.base_asset = ctx["base_asset"]
+        self.quote_asset = ctx["quote_asset"]
+        self.pair_label = ctx["pair_label"]
+        self.timeframe_label = ctx["timeframe_label"]
+        self._context_key = new_key
+
+        if changed and reset_history:
+            stale = len(self.signal_history)
+            self.signal_history.clear()
+            self._log_warning(
+                f"⚠️ Instrument context changed ({previous_key[0]} -> {new_key[0]}), "
+                f"cleared stale signal_history={stale}"
+            )
+
+    def _refresh_context_from_price_data(self, price_data: Dict[str, Any]) -> None:
+        """Refresh analyzer context from live payload metadata."""
+        instrument_id = str(price_data.get("instrument_id") or self.instrument_id)
+        bar_type = str(price_data.get("bar_type") or self.bar_type)
+        self._set_instrument_context(
+            instrument_id=instrument_id,
+            bar_type=bar_type,
+            reset_history=True,
+        )
+
+    def _build_system_prompt(self) -> str:
+        """Build dynamic system prompt tied to active instrument context."""
+        return (
+            "You are an elite algorithmic trading system specializing in "
+            f"{self.pair_label} perpetual futures on {self.venue}. "
+            f"You analyze {self.timeframe_label} K-line data with precision, combining "
+            "technical indicators, market microstructure, and sentiment analysis. "
+            "Your decisions must be data-driven, risk-aware, and execution-aware "
+            "(spread/depth/liquidity). Always return responses strictly in JSON format."
+        )
 
     def _log_info(self, msg: str):
         if self._nautilus_log:
@@ -120,6 +218,8 @@ class DeepSeekAnalyzer:
                 "timestamp": str
             }
         """
+        self._refresh_context_from_price_data(price_data)
+
         for attempt in range(self.max_retries):
             try:
                 signal = self._analyze_with_retry(
@@ -160,6 +260,10 @@ class DeepSeekAnalyzer:
         self._log_info(
             f"🤖 LLM Prompt Payload: {json.dumps(prompt_payload, ensure_ascii=False)}"
         )
+        micro_included = self._has_microstructure_features(price_data.get("microstructure"))
+        self._log_info(
+            f"🤖 Prompt microstructure section included: {'true' if micro_included else 'false'}"
+        )
 
         # Call DeepSeek API
         response = self.client.chat.completions.create(
@@ -167,14 +271,7 @@ class DeepSeekAnalyzer:
             messages=[
                 {
                     "role": "system",
-                    "content": (
-                        "You are an elite algorithmic trading system specializing in "
-                        "high-frequency cryptocurrency trading on Binance Futures (BTCUSDT-PERP). "
-                        "You analyze 15-minute K-line data with precision, combining multiple "
-                        "technical indicators, market microstructure, and sentiment analysis. "
-                        "Your decisions must be data-driven, risk-aware, and optimized for "
-                        "15-minute timeframe characteristics. Always return responses strictly in JSON format."
-                    )
+                    "content": self._build_system_prompt()
                 },
                 {"role": "user", "content": prompt}
             ],
@@ -319,6 +416,9 @@ class DeepSeekAnalyzer:
 
         # Position info
         position_text = self._format_position_data(current_position)
+        microstructure_text = self._format_microstructure_data(
+            price_data.get("microstructure")
+        )
 
         # Previous signal
         signal_text = ""
@@ -332,7 +432,7 @@ class DeepSeekAnalyzer:
 
         prompt = f"""
 ═══════════════════════════════════════════════════════════════
-  BTC/USDT FUTURES - 15-MINUTE TIMEFRAME ANALYSIS
+  {self.pair_label} FUTURES - {self.timeframe_label.upper()} TIMEFRAME ANALYSIS
 ═══════════════════════════════════════════════════════════════
 
 【MARKET CONTEXT - REAL-TIME DATA】
@@ -340,6 +440,8 @@ class DeepSeekAnalyzer:
 {kline_text}
 
 {technical_text}
+
+{microstructure_text}
 
 {sentiment_text}
 
@@ -350,7 +452,7 @@ class DeepSeekAnalyzer:
 ├─ Time: {price_data['timestamp']}
 ├─ Period High: ${price_data.get('high', 0):,.2f}
 ├─ Period Low: ${price_data.get('low', 0):,.2f}
-├─ Volume: {price_data.get('volume', 0):.2f} BTC
+├─ Volume: {price_data.get('volume', 0):.2f} {self.base_asset}
 ├─ Price Change: {price_data.get('price_change', 0):+.2f}%
 └─ Current Position: {position_text}
 
@@ -366,7 +468,7 @@ class DeepSeekAnalyzer:
 
 【1. DECISION HIERARCHY (Weight Distribution)】
 
-Primary Layer (60% weight) - TECHNICAL ANALYSIS:
+Primary Layer (50% weight) - TECHNICAL ANALYSIS:
 ├─ Trend Direction (MA alignment, price action)
 │  ├─ Strong uptrend: Price > SMA5 > SMA20 > SMA50 → BUY bias
 │  ├─ Strong downtrend: Price < SMA5 < SMA20 < SMA50 → SELL bias
@@ -380,15 +482,31 @@ Primary Layer (60% weight) - TECHNICAL ANALYSIS:
    ├─ Bearish patterns (shooting star, dark cloud, etc.) → SELL signal
    └─ Doji/indecision → Wait for confirmation
 
-Secondary Layer (30% weight) - MARKET SENTIMENT:
+Secondary Layer (15% weight) - ORDER BOOK MICROSTRUCTURE:
+├─ Spread / spread-volatility: tighter and stable spreads improve execution confidence
+├─ TOB/depth imbalance + queue pressure: directional order book skew confirms bias
+├─ OFI and trade-flow imbalance: net aggressive flow should align with signal direction
+├─ VWAP deviation + sweep counts: detect exhaustion, absorption, or continuation bursts
+└─ Depth regime (thin/normal/thick): thin books increase slippage risk and false breaks
+
+Tertiary Layer (25% weight) - MARKET SENTIMENT:
 ├─ Sentiment aligns with technical → Enhance confidence by 1 level
 ├─ Sentiment diverges from technical → Follow technical, sentiment as warning
 └─ Sentiment data unavailable/delayed → Ignore, focus on technical
 
-Tertiary Layer (10% weight) - RISK MANAGEMENT:
+Quaternary Layer (10% weight) - RISK MANAGEMENT:
 ├─ Current position P&L status
 ├─ Stop-loss placement (should be 1-2% from entry)
 └─ Position sizing constraints
+
+【1B. MICROSTRUCTURE EXECUTION FILTERS (Quant Calibration)】
+├─ Directional agreement improves confidence:
+│  ├─ Bullish: tob/depth imbalance > 0, ema_ofi > 0, trade_flow_imbalance > 0
+│  └─ Bearish: tob/depth imbalance < 0, ema_ofi < 0, trade_flow_imbalance < 0
+├─ Friction penalty:
+│  └─ If spread widens, spread_volatility rises, or depth_regime is thin, reduce confidence by one level
+└─ Conflict handling:
+   └─ If technical bias and microstructure bias strongly disagree, prefer HOLD unless a clear breakout is confirmed by volume
 
 【2. SIGNAL GENERATION LOGIC - STRICT RULES】
 
@@ -452,13 +570,13 @@ LOW Confidence:
    └─ High-confidence signals require volume confirmation
    └─ Low volume moves are less reliable
 
-【5. 15-MINUTE TIMEFRAME SPECIFIC CONSIDERATIONS】
+【5. {self.timeframe_label.upper()} TIMEFRAME SPECIFIC CONSIDERATIONS】
 
-├─ Balanced timeframe for both trend following and swing trading
-├─ Signals are more reliable with reduced noise compared to 1-minute
-├─ Volume analysis is important for confirmation
-├─ RSI > 70 or < 30 indicates strong momentum (act with caution)
-└─ MACD crossovers are significant and should be respected
+├─ Prioritize setups consistent with this timeframe's trend structure
+├─ Confirm breakouts with both volume and microstructure alignment
+├─ RSI extremes indicate momentum but require context from structure and liquidity
+├─ MACD crossovers matter more when supported by price action
+└─ In low-volume consolidation, HOLD is preferred over forced entries
 
 【6. RISK MANAGEMENT INTEGRATION】
 
@@ -527,7 +645,7 @@ Remember: Be decisive but not reckless. Quality over quantity.
             return "【Recent K-line Data】\nNo K-line data available"
 
         window = kline_data[-min(len(kline_data), 30):]
-        kline_text = f"【Recent {len(window)} 15-minute K-lines (Most Recent)】\n"
+        kline_text = f"【Recent {len(window)} {self.timeframe_label} K-lines (Most Recent)】\n"
         for i, kline in enumerate(window, 1):
             candle_type = "🟢 Bullish" if kline['close'] > kline['open'] else "🔴 Bearish"
             change = ((kline['close'] - kline['open']) / kline['open']) * 100
@@ -543,6 +661,79 @@ Remember: Be decisive but not reckless. Quality over quantity.
                 f"Body:{body_ratio:.1f}%\n"
             )
         return kline_text
+
+    def _has_microstructure_features(self, micro_data: Optional[Dict[str, Any]]) -> bool:
+        """Return True when at least one target microstructure field is present."""
+        if not isinstance(micro_data, dict):
+            return False
+        fields = (
+            "spread_bps",
+            "spread_volatility",
+            "tob_imbalance",
+            "depth_imbalance",
+            "ema_ofi",
+            "queue_pressure",
+            "trade_flow_imbalance",
+            "vwap_deviation_bps",
+            "sweep_buy_count",
+            "sweep_sell_count",
+            "depth_regime",
+        )
+        return any(micro_data.get(field) is not None for field in fields)
+
+    def _format_microstructure_data(self, micro_data: Optional[Dict[str, Any]]) -> str:
+        """Format order book microstructure section for analysis prompt."""
+        if not self._has_microstructure_features(micro_data):
+            return (
+                "【Order Book Microstructure (15% weight)】\n"
+                "Data unavailable this cycle; do not infer microstructure bias from missing fields."
+            )
+
+        micro = micro_data or {}
+        def _f(key: str, default: float = 0.0) -> float:
+            val = micro.get(key, default)
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return default
+
+        def _i(key: str, default: int = 0) -> int:
+            val = micro.get(key, default)
+            try:
+                return int(val)
+            except (TypeError, ValueError):
+                return default
+
+        lines = [
+            "【Order Book Microstructure (15% weight)】",
+            (
+                "├─ Spread: "
+                f"{_f('spread_bps'):.2f} bps | "
+                f"Spread Volatility: {_f('spread_volatility'):.4f}"
+            ),
+            (
+                "├─ TOB Imbalance: "
+                f"{_f('tob_imbalance'):+.4f} | "
+                f"Depth Imbalance: {_f('depth_imbalance'):+.4f}"
+            ),
+            (
+                "├─ EMA OFI: "
+                f"{_f('ema_ofi'):+.5f} | "
+                f"Queue Pressure: {_f('queue_pressure'):+.4f}"
+            ),
+            (
+                "├─ Trade Flow Imbalance: "
+                f"{_f('trade_flow_imbalance'):+.4f} | "
+                f"VWAP Deviation: {_f('vwap_deviation_bps'):+.2f} bps"
+            ),
+            (
+                "├─ Sweep Counts: "
+                f"Buy {_i('sweep_buy_count')} | "
+                f"Sell {_i('sweep_sell_count')}"
+            ),
+            f"└─ Depth Regime: {micro.get('depth_regime', 'unknown')}",
+        ]
+        return "\n".join(lines)
 
     def _format_technical_data(self, technical_data: Dict[str, Any]) -> str:
         """Format technical indicator data for prompt."""
@@ -618,9 +809,9 @@ Remember: Be decisive but not reckless. Quality over quantity.
 
         return (
             f"{position['side']} position, "
-            f"Size: {position.get('quantity', 0):.3f} BTC, "
+            f"Size: {position.get('quantity', 0):.3f} {self.base_asset}, "
             f"Avg Price: ${position.get('avg_px', 0):.2f}, "
-            f"P&L: {position.get('unrealized_pnl', 0):.2f} USDT"
+            f"P&L: {position.get('unrealized_pnl', 0):.2f} {self.quote_asset}"
         )
 
     def _safe_parse_json(self, json_str: str) -> Optional[Dict[str, Any]]:

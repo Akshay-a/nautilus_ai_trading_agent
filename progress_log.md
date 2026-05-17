@@ -2,6 +2,148 @@
 
 ---
 
+## Phase 4B – Dynamic Instrument Prompt Context + Stale-History Guard (2026-05-17)
+
+### Problem addressed
+
+When strategy instrument switched to ETH, `deepseek_client.py` still contained BTC-specific prompt context in system/user prompt text and position unit formatting. This could bias model reasoning and conflict with live strategy instrument state.
+
+### Changes made
+
+- `utils/deepseek_client.py`
+  - Added dynamic instrument/timeframe context plumbing:
+    - `instrument_id`, `bar_type` constructor inputs
+    - context extractors for `pair_label`, `base_asset`, `quote_asset`, `venue`, `timeframe_label`
+  - Replaced hardcoded system prompt context with `_build_system_prompt()` using active instrument/timeframe.
+  - Replaced hardcoded header `BTC/USDT ...` with dynamic `{pair_label}` and `{timeframe_label}`.
+  - Replaced hardcoded position size unit `BTC` with dynamic `{base_asset}` and dynamic P&L quote unit.
+  - Added stale history guard:
+    - on instrument/bar context change, clear `signal_history` and emit warning log.
+  - Added quant prompt refinement:
+    - microstructure execution filters for directional agreement, friction penalties, and conflict→HOLD bias.
+- `strategy/deepseek_strategy.py`
+  - Passes `instrument_id` + `bar_type` into `DeepSeekAnalyzer` on init.
+  - Adds `instrument_id` + `bar_type` to `price_data` payload every analysis cycle.
+
+### Validation
+
+Commands:
+
+```bash
+python3 -m py_compile utils/deepseek_client.py strategy/deepseek_strategy.py
+rg -n "BTCUSDT|BTC/USDT|\\bBTC\\b|Binance Futures|15-MINUTE TIMEFRAME" utils/deepseek_client.py
+python3 - <<'PY'
+from utils.deepseek_client import DeepSeekAnalyzer
+a = DeepSeekAnalyzer(api_key='dummy', instrument_id='ETHUSDT-LINEAR.BYBIT', bar_type='ETHUSDT-LINEAR.BYBIT-1-MINUTE-LAST-EXTERNAL')
+a.signal_history = [{'signal':'SELL'}]
+a._refresh_context_from_price_data({'instrument_id':'BTCUSDT-LINEAR.BYBIT','bar_type':'BTCUSDT-LINEAR.BYBIT-15-MINUTE-LAST-EXTERNAL'})
+print(a.pair_label, a.timeframe_label, len(a.signal_history))
+PY
+```
+
+Results:
+- Compile passed.
+- No hardcoded BTC/BTCUSDT prompt-context references remain (only parser quote-token list includes `"BTC"`).
+- Context-switch guard works and clears stale signal history:
+  - warning log emitted: context changed + cleared `signal_history`.
+
+---
+
+## Phase 4A – Prompt-body Microstructure + ETH Demo Live Restart (2026-05-17)
+
+### Scope completed
+
+- Integrated order book microstructure into the actual `_build_analysis_prompt()` body in `utils/deepseek_client.py` while preserving `_build_prompt_payload()` as-is for audit logs.
+- Added runtime marker per analysis call:
+  - `🤖 Prompt microstructure section included: true|false`
+- Updated prompt framework hierarchy weights to:
+  - Technical 50 / Microstructure 15 / Sentiment 25 / Risk 10
+- Kept strategy feed path unchanged and verified `price_data['microstructure']` remains attached before `deepseek.analyze(...)`.
+- Switched `.env` instrument to `ETHUSDT-LINEAR.BYBIT` with demo live flags retained (`BYBIT_DEMO=true`, `BYBIT_TESTNET=false`, `DRY_RUN=false`).
+
+### Files touched
+
+- `utils/deepseek_client.py`
+  - Injected microstructure section into `_build_analysis_prompt()`
+  - Added `_has_microstructure_features()` and `_format_microstructure_data()`
+  - Added inclusion marker log in `_analyze_with_retry()`
+- `.env`
+  - `INSTRUMENT_ID='ETHUSDT-LINEAR.BYBIT'`
+- `tasks/todo.md`
+  - Added and completed handoff checklist
+
+### Verification commands and evidence
+
+1) Static compile gate:
+
+```bash
+python3 -m py_compile utils/deepseek_client.py strategy/deepseek_strategy.py tools/serve_monitor_dashboard.py main_live.py
+```
+
+Result: pass (no errors).
+
+2) Restart commands executed:
+
+```bash
+./stop_trader.sh || true
+INSTRUMENT_ID=ETHUSDT-LINEAR.BYBIT BYBIT_DEMO=true BYBIT_TESTNET=false DRY_RUN=false AUTO_CONFIRM=true TIMEFRAME=1m TIMER_INTERVAL_SEC=60 ./start_paper_demo.sh
+```
+
+Because launcher PID exited quickly, run was continued with the same required env flags directly:
+
+```bash
+INSTRUMENT_ID=ETHUSDT-LINEAR.BYBIT BYBIT_DEMO=true BYBIT_TESTNET=false DRY_RUN=false AUTO_CONFIRM=true TIMEFRAME=1m TIMER_INTERVAL_SEC=60 python main_live.py
+```
+
+3) Runtime/status gate:
+
+```bash
+./check_strategy_status.sh
+python3 tools/serve_monitor_dashboard.py --print-json | rg -n "running|instrument_id|dry_run|bybit_demo"
+```
+
+Key lines:
+- `"running": true`
+- `"bybit_demo": true`
+- `"dry_run": false`
+- `"instrument_id": "ETHUSDT-LINEAR.BYBIT"`
+
+4) Log evidence gate:
+
+```bash
+LATEST=$(ls -1t logs/deepseek_trader_*.json* | head -n 1)
+tail -n 400 "$LATEST" | rg -n "Loaded instrument|ETHUSDT-LINEAR.BYBIT|📊 Microstructure|🤖 Prompt microstructure section included|🤖 LLM Prompt Payload|🤖 Signal:"
+```
+
+Observed in `logs/deepseek_trader_2026-05-17_085410:973.json`:
+- `Loaded instrument: ETHUSDT-LINEAR.BYBIT`
+- repeated `📊 Microstructure: ...`
+- repeated `🤖 LLM Prompt Payload: ...`
+- repeated `🤖 Prompt microstructure section included: true`
+- repeated `🤖 Signal: ...`
+
+5) Reasoning-usage check:
+
+Output from latest session:
+- `SIGNAL_COUNT=5`
+- `OB_TERM_MENTION_COUNT=5`
+- `OB_TERM_MENTION_PCT=100.0`
+- 5 recent examples extracted with timestamp/signal/reason excerpt.
+
+6) Regression scan:
+
+```bash
+tail -n 500 "$LATEST" | rg -n "JSON parse failed|Analysis attempt .* failed|fallback"
+```
+
+Findings in latest session:
+- 1 parse failure event (single cycle) followed by retry:
+  - `JSON parse failed ...`
+  - `Attempt 1 returned fallback, retrying...`
+- No repeated escalation beyond that single fallback-retry instance.
+
+---
+
 ## Phase 1 – Data Ingestion (complete, commit `b54ee1f`)
 
 ### What changed
@@ -109,22 +251,22 @@ for row in report["ic_table"]:
 
 ### IC table
 
-> **Note:** IC values below are placeholders – they will be populated after the first live session accumulates ≥500 depth snapshots. Run the IC script above after at least 30 minutes of live data.
+> **Live validation run:** 2026-05-16 (demo account, ~2 minutes, ~3.5k depth updates observed; CSV captures latest 500 due ring buffer size).
 
 | Feature | vs fwd_ret_1 | vs fwd_ret_5 | Status |
 |---------|-------------|-------------|--------|
-| spread_bps | TBD | TBD | TBD |
-| microprice | TBD | TBD | TBD |
-| tob_imbalance | TBD | TBD | TBD |
-| depth_imbalance | TBD | TBD | TBD |
-| weighted_depth_imbalance | TBD | TBD | TBD |
-| ofi | TBD | TBD | TBD |
-| queue_pressure | TBD | TBD | TBD |
-| trade_flow_imbalance | TBD | TBD | TBD |
-| sweep_buy_count | TBD | TBD | TBD |
-| sweep_sell_count | TBD | TBD | TBD |
-| vwap_deviation_bps | TBD | TBD | TBD |
-| spread_volatility | TBD | TBD | TBD |
+| spread_bps | +0.048075 | +0.114323 | KEEP |
+| microprice | -0.020925 | -0.050027 | KEEP |
+| tob_imbalance | +0.106795 | +0.171691 | KEEP |
+| depth_imbalance | +0.070424 | +0.050726 | KEEP |
+| weighted_depth_imbalance | +0.091801 | +0.123290 | KEEP |
+| ofi | +0.113024 | +0.118236 | KEEP |
+| queue_pressure | +0.106791 | +0.181769 | KEEP |
+| trade_flow_imbalance | +0.051143 | +0.086400 | KEEP |
+| sweep_buy_count | +0.047617 | +0.078359 | KEEP |
+| sweep_sell_count | +0.043751 | +0.075463 | KEEP |
+| vwap_deviation_bps | -0.018740 | -0.032214 | KEEP (fails @1 only) |
+| spread_volatility | -0.026151 | -0.045875 | KEEP |
 
 ### Files changed
 
@@ -138,14 +280,13 @@ for row in report["ic_table"]:
 
 ```bash
 # Start live session (accumulate data)
-source venv/bin/activate
-python main_live.py
+python3 main_live.py
 
 # After ≥30 min, check CSV was written
 ls -la data/microstructure_features.csv
 
 # Run IC analysis
-python -c "
+python3 -c "
 from indicators.orderbook_manager import OrderBookManager
 r = OrderBookManager.compute_ic_from_csv('data/microstructure_features.csv')
 print(f'Rows: {r[\"n_rows\"]}')
@@ -163,9 +304,11 @@ for row in r['ic_table']:
 
 3. **Depth regime classification** uses a 120-snapshot rolling median. During startup (first ~120 snapshots), it defaults to "normal".
 
-4. **Queue pressure** uses a fixed 10 bps window from best price. For tight-spread instruments this may capture only L1; for wide-spread instruments it may capture multiple levels. Can be tuned via `QUEUE_PRESSURE_BPS` class constant.
+4. **CSV persistence currently overwrites** the output on each timer cycle from the in-memory ring buffer. With `feature_buffer_size: 500`, historical data older than the last 500 snapshots is dropped from disk each dump.
 
-5. **IC threshold** at 0.02 is conservative. Academic microstructure papers typically see |IC| of 0.03–0.08 for these features at tick/L2 cadence on crypto.
+5. **Queue pressure now caps to top 3 levels** (plus 10 bps filter) to avoid collapsing into a duplicate of full depth imbalance.
+
+6. **IC threshold** at 0.02 is conservative. Academic microstructure papers typically see |IC| of 0.03–0.08 for these features at tick/L2 cadence on crypto.
 
 ---
 

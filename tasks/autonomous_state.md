@@ -13,11 +13,11 @@ This file is owned by the hourly automation. Update it every run.
 - `notes`: one short line
 
 ## Current
-- mode: `HEAL`
-- last_run_utc: `2026-05-16T16:39:42Z`
+- mode: `VERIFY_PREV_SHIP`
+- last_run_utc: `2026-05-17T01:26:07Z`
 - last_health: `GREEN`
-- last_shipped_commit: `pending`
-- pending_live_verify: `yes`
-- pending_live_verify_target: `pending`
+- last_shipped_commit: `62d5133`
+- pending_live_verify: `no`
+- pending_live_verify_target: `none`
 - active_backlog_item: `none`
-- notes: `HEAL run: status now infers running from fresh strategy heartbeat logs when PID probing is unavailable in sandbox`
+- notes: `Verified 62d5133 in live feed: running inferred from fresh logs, status coherent, and short sizing remains ~10k notional`

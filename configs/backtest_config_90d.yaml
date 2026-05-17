@@ -1,0 +1,42 @@
+run:
+  run_id: "btc15m_native_backtest_90d"
+  catalog_path: "data/catalog_90d"
+  results_dir: "backtest_results"
+
+data:
+  symbol: "BTCUSDT"
+  instrument_id: "BTCUSDT-LINEAR.BYBIT"
+  bar_type: "BTCUSDT-LINEAR.BYBIT-15-MINUTE-LAST-EXTERNAL"
+  interval_minutes: 15
+  start: "2026-02-16T00:00:00Z"
+  end: "2026-05-17T00:00:00Z"
+
+split:
+  train_ratio: 0.70
+
+portfolio:
+  starting_balance: "100000 USDT"
+  fixed_trade_usdt: 10000
+  min_trade_amount: 0.001
+  allow_short: true
+
+costs:
+  maker_fee: 0.0002
+  taker_fee: 0.00055
+  slippage_bps_baseline: 1
+  slippage_bps_sensitivity: [2, 5]
+  funding_rate_available: false
+  funding_rate_assumption: "Funding costs excluded (historical funding series not provided in this dataset)."
+
+variants:
+  - "buy_and_hold"
+  - "rule_proxy"
+  - "recorded_llm_replay"
+
+replay:
+  log_patterns:
+    - "logs/deepseek_trader_*.json"
+    - "logs/deepseek_trader_*.json.*"
+
+quality:
+  min_months_target: 6
