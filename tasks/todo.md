@@ -1,5 +1,40 @@
 # TODO
 
+## Plan (README Reframe - Solo AI Trading Agent Experiment - 2026-05-17)
+- [x] Audit current README, repo remotes, and local docs for original upstream attribution.
+- [x] Rewrite README around this fork as a solo developer experiment, with clear scope and safety disclaimers.
+- [x] Highlight the added Bybit order book pipeline, raw features, derived microstructure signals, LLM decision loop, dashboard, and backtesting utilities.
+- [x] Add proper acknowledgement to the original `Patrick-code-Bot/nautilus_AItrader` repo and NautilusTrader.
+- [x] Verify README consistency for stale Binance/BTC-only claims and update this task with review notes.
+
+## Review (README Reframe - Solo AI Trading Agent Experiment - 2026-05-17)
+- Replaced the upstream-style 1,800-line README with a focused 324-line README for this fork.
+- Added explicit acknowledgement that this project forks and extends `Patrick-code-Bot/nautilus_AItrader`.
+- Reframed the project as a solo developer research experiment, not a production-ready or profitable strategy claim.
+- Documented current fork-specific work: Bybit integration, L2 order book ingestion, microstructure feature pipeline, LLM prompt audit logs, dashboard, and Nautilus-native backtesting tools.
+- Verification: searched the new README for stale Binance/BTC-PERP/upstream versioning claims; remaining BTC references are current Bybit defaults/backtest examples only.
+
+## Plan (Dynamic Instrument Context + Prompt Refinement - 2026-05-17)
+- [x] Remove hardcoded BTC/BTCUSDT references from DeepSeek system/user prompt context.
+- [x] Make instrument, venue, pair label, base asset unit, and timeframe labels dynamic in `DeepSeekAnalyzer`.
+- [x] Guard against stale `signal_history` across instrument switches by resetting history when context changes.
+- [x] Pass explicit instrument metadata from strategy into analyzer input payload.
+- [x] Add quant-oriented prompt refinements for microstructure-aware confidence handling without changing output JSON schema.
+- [x] Run static compile verification and confirm references via targeted grep.
+- [x] Update `tasks/todo.md` and `progress_log.md` with outcomes.
+
+## Plan (Microstructure Prompt Integration + ETH Demo Live Restart - 2026-05-17)
+- [x] Verify mandatory context files and confirm existing microstructure feed path into `deepseek.analyze`.
+- [x] Implement prompt-body microstructure section in `utils/deepseek_client.py` while keeping `_build_prompt_payload()` and JSON schema/parsing unchanged.
+- [x] Add explicit runtime marker `🤖 Prompt microstructure section included: true|false` to prove prompt inclusion per analysis call.
+- [x] Keep strategy feed path unchanged and verify `price_data['microstructure']` attachment in `strategy/deepseek_strategy.py`.
+- [x] Update `.env` to deterministic ETH demo live settings (`INSTRUMENT_ID=ETHUSDT-LINEAR.BYBIT`, `BYBIT_DEMO=true`, `BYBIT_TESTNET=false`, `DRY_RUN=false`).
+- [x] Run static compile checks for target files.
+- [x] Restart via required command (`stop_trader` + `start_paper_demo.sh` with ETH/demo/live flags).
+- [x] Run runtime/status checks and log evidence checks from latest logs after several analysis cycles.
+- [x] Run reasoning-usage and regression checks (OB-term mention rate + parse/fallback scan).
+- [x] Update `progress_log.md` with concrete evidence and outcomes.
+
 ## Plan (Autonomous Self-Heal + Self-Build Loop)
 - [x] Audit existing hourly automation prompt/goal artifacts in `tasks/`.
 - [x] Define centralized backlog with explicit done/verify/kill criteria.
@@ -151,3 +186,59 @@
   - Signal changed. Did position actually flip? `No flip observed in latest window (HOLD↔SELL while position remained SHORT).`
   - Did we close-only or close-and-reverse? `Neither observed this run; no BUY/SELL opposite-side transition event in parsed logs.`
   - Did resulting position notional match sizing policy? `Yes; logs show fixed sizing line ~ $10k notional (0.128 BTC).`
+
+## Review (Autonomous Run 2026-05-17 11:00 AEST - VERIFY_PREV_SHIP)
+- Verified commit `62d5133` behavior from fresh runtime snapshot:
+  - `process.running=true` with `inferred_from_logs=true`
+  - fresh `log_timestamp_utc` (`2026-05-17T01:24:56.808390000Z`)
+  - coherent state: last signal `SELL`, open position `SHORT 0.128 @ 78261.41`, deepseek calls increasing.
+- Mandatory trader behavior audit:
+  - Signal changed. Did position actually flip? `No BUY↔SELL direction flip in latest window; signal oscillated HOLD/SELL while net side stayed SHORT.`
+  - Did we close-only or close-and-reverse? `Not triggered this hour due no opposite-direction transition.`
+  - Did resulting position notional match sizing policy? `Yes; 0.128 BTC at ~77.9k ≈ $10k target notional.`
+
+## Plan (Backtesting Layer - Nautilus Native Only - 2026-05-17)
+- [x] Audit existing Nautilus usage and create minimal reusable backtest adapter module (no custom replay/fill/portfolio engine).
+- [x] Add backtest config file `configs/backtest_config.yaml` with venue, instrument, date range, split, cost assumptions, and variant toggles.
+- [x] Implement historical bars ingestion script for Bybit BTCUSDT 15m -> Nautilus `ParquetDataCatalog` using `BarDataWrangler`.
+- [x] Implement catalog validation command to report bar count, UTC date coverage, and missing 15m intervals.
+- [x] Implement deterministic analyzer modes for backtest only:
+- [x] `recorded_llm_replay` (timestamp-aligned signal replay from `logs/deepseek_trader_*.json*`, no external API calls).
+- [x] `rule_proxy` (deterministic technical-only decision proxy).
+- [x] Add mode/config plumbing that keeps live LLM path untouched.
+- [x] Implement single backtest CLI runner `tools/run_backtest.py --config ...` using Nautilus `BacktestEngine`/`BacktestNode` + catalog data.
+- [x] Implement variant execution for `buy_and_hold`, `rule_proxy`, `recorded_llm_replay`; skip with explicit reason when inputs are insufficient.
+- [x] Implement split protocol (time-ordered 70/30) and mandatory OOS reporting.
+- [x] Implement results export to `backtest_results/{timestamp}_{run_id}/`:
+- [x] config snapshot
+- [x] metrics (JSON + CSV)
+- [x] trade list
+- [x] equity curve
+- [x] run log (assumptions, warnings, insufficiency reasons)
+- [x] Add cost sensitivity reruns for slippage 1/2/5 bps and include configured fees.
+- [x] Add determinism hash + sanity flags + viability verdict (`PASS` / `KILL` / `INCONCLUSIVE`) based on OOS metrics.
+- [x] Run verification commands and capture outputs in review section below.
+
+## Review (Backtesting Layer - Nautilus Native Only - 2026-05-17)
+- Implemented files:
+  - `backtesting/` module (`data_pipeline.py`, `instruments.py`, `replay.py`, `metrics.py`, `__init__.py`)
+  - `strategy/backtest_variants.py`
+  - `tools/fetch_bybit_bars.py`
+  - `tools/run_backtest.py`
+  - `configs/backtest_config.yaml`
+  - `strategy/__init__.py` updated for backtest variant exports.
+- Verification commands + key outputs:
+  - `python3 -m py_compile backtesting/__init__.py backtesting/instruments.py backtesting/replay.py backtesting/metrics.py backtesting/data_pipeline.py strategy/backtest_variants.py tools/fetch_bybit_bars.py tools/run_backtest.py`
+    - Result: pass.
+  - `python3 tools/fetch_bybit_bars.py fetch --start 2025-01-01T00:00:00Z --end 2025-07-01T00:00:00Z --catalog-path data/catalog --symbol BTCUSDT --instrument-id BTCUSDT-LINEAR.BYBIT --bar-type BTCUSDT-LINEAR.BYBIT-15-MINUTE-LAST-EXTERNAL --interval-minutes 15 --maker-fee 0.0002 --taker-fee 0.00055`
+    - Result: 17,377 bars written, coverage 2025-01-01 to 2025-07-01, missing intervals 0.
+  - `python3 tools/fetch_bybit_bars.py validate --catalog-path data/catalog --bar-type BTCUSDT-LINEAR.BYBIT-15-MINUTE-LAST-EXTERNAL --interval-minutes 15`
+    - Result: bars 17,377; expected bars 17,377; missing intervals 0.
+  - `python3 tools/run_backtest.py --config configs/backtest_config.yaml`
+    - Result: artifacts written to `backtest_results/20260517T092226Z_btc15m_native_backtest/`
+    - Metrics rows: 12 (variants x split x slippage scenarios)
+    - Replay variant skipped with explicit reason: no timestamp overlap between replay logs and configured backtest window.
+    - Viability verdict: `KILL`.
+    - Determinism hash: `c46c88fb5a839617d18ace784e6279335831ca8a23c25fac9c6365bfc7f9c5b0`.
+  - `python3 tools/run_backtest.py --config configs/backtest_config.yaml` (repeat)
+    - Result: identical determinism hash `c46c88fb5a839617d18ace784e6279335831ca8a23c25fac9c6365bfc7f9c5b0`.
