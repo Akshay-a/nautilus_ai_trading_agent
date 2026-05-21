@@ -653,7 +653,7 @@ class OrderBookManager:
         fwd_bars: Tuple[int, ...] = (1, 5),
     ) -> str:
         """
-        Write the feature buffer to CSV with forward-return columns.
+        Append feature rows to CSV with forward-return columns.
 
         Forward returns are computed from the mid price series within
         the feature buffer itself (so both features and returns share
@@ -667,9 +667,8 @@ class OrderBookManager:
             How many *depth snapshots* ahead to compute returns.
             Default (1, 5) gives "fwd_ret_1" and "fwd_ret_5".
 
-        Returns
-        -------
-        str  Path to the written file.
+        Existing files are extended (no truncation). New rows are selected
+        by timestamp so repeated dumps only append unseen rows.
         """
         buf = list(self._feature_buf)
         n = len(buf)
@@ -681,10 +680,46 @@ class OrderBookManager:
         extra_cols = [f"fwd_ret_{k}" for k in fwd_bars]
         header = self._FEATURE_COLUMNS + extra_cols
 
-        with open(path, "w", newline="") as fh:
+        def _read_last_ts(csv_path: str) -> Optional[int]:
+            if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
+                return None
+            with open(csv_path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                step = min(8192, size)
+                pos = size
+                chunk = b""
+                while pos > 0:
+                    pos = max(0, pos - step)
+                    fh.seek(pos)
+                    chunk = fh.read(size - pos) + chunk
+                    lines = chunk.splitlines()
+                    if len(lines) >= 2:
+                        break
+                    if pos == 0:
+                        break
+                    size = pos
+                if not lines:
+                    return None
+                last = lines[-1].decode("utf-8", errors="ignore").strip()
+                if not last or last == ",".join(header):
+                    return None
+                try:
+                    return int(last.split(",", 1)[0])
+                except (TypeError, ValueError):
+                    return None
+
+        last_ts = _read_last_ts(path)
+        append_mode = os.path.exists(path) and os.path.getsize(path) > 0
+
+        with open(path, "a" if append_mode else "w", newline="") as fh:
             writer = csv.DictWriter(fh, fieldnames=header)
-            writer.writeheader()
+            if not append_mode:
+                writer.writeheader()
+
             for i in range(n):
+                if last_ts is not None and buf[i].ts <= last_ts:
+                    continue
                 row = self._feature_row(buf[i])
                 for k in fwd_bars:
                     if i + k < n and buf[i].mid > 0:

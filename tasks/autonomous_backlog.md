@@ -27,7 +27,7 @@ Verify with:
 ---
 
 ## B1 - Phase 2 hardening: persist longer feature history
-Status: `PENDING`
+Status: `DONE`
 Scope:
 - Stop losing historical samples from `data/microstructure_features.csv` due overwrite.
 - Preserve backward compatibility for current IC command.
@@ -39,6 +39,10 @@ Verify with:
 - `python3 -c "from indicators.orderbook_manager import OrderBookManager as O;print(O.compute_ic_from_csv('data/microstructure_features.csv')['n_rows'])"`
 Kill criteria:
 - Any change that breaks current status/dashboard or strategy startup.
+
+Completion notes (2026-05-21):
+- `dump_features_csv` now appends unseen timestamps instead of truncating/re-writing each cycle.
+- IC utility remains compatible with appended output.
 
 ---
 
@@ -83,4 +87,3 @@ Verify with:
 - Command exits 0 and prints table for each selected feature.
 Kill criteria:
 - Undefined timestamp alignment or silent leakage/lookahead.
-

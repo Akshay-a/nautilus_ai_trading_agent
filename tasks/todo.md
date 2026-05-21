@@ -1,5 +1,44 @@
 # TODO
 
+## Plan (Autonomous Run - B1 Feature History Persistence - 2026-05-21)
+- [x] Run health gate and mandatory trader behavior audit from status + dashboard + fresh logs.
+- [x] Execute `BUILD_NEXT` for backlog item B1 and patch feature persistence to avoid CSV truncation.
+- [x] Validate append behavior and IC compatibility, then record autonomous run evidence/state updates.
+
+## Review (Autonomous Run - B1 Feature History Persistence - 2026-05-21)
+- Health gate: GREEN (`process.running=true` inferred from fresh logs, latest timestamp progressing, status snapshot coherent, demo-safety flags intact).
+- Mandatory trader behavior audit:
+  - Signal changed. Did position actually flip? `No opposite-side BUY/SELL reversal event observed; position remained SHORT while signals oscillated SELL/HOLD.`
+  - Did we close-only or close-and-reverse? `Neither triggered this run window (no BUY-on-SHORT or SELL-on-LONG transition).`
+  - Did resulting position notional match sizing policy? `Yes; logs continue to show fixed sizing near $10k notional while holding short inventory.`
+- Implemented B1 in [`/Users/akshayapsingi/Projects/nautilus_ai_trading_agent/indicators/orderbook_manager.py`](/Users/akshayapsingi/Projects/nautilus_ai_trading_agent/indicators/orderbook_manager.py):
+  - `dump_features_csv` now appends unseen rows by timestamp and avoids file truncation.
+- Validation:
+  - `python3 -m py_compile indicators/orderbook_manager.py` passed.
+  - Synthetic append proof (same serializer path): line count grew `11 -> 16`; IC utility remained functional with `n_rows=15`.
+  - `python3 -c "from indicators.orderbook_manager import OrderBookManager as O;print(O.compute_ic_from_csv('data/microstructure_features.csv')['n_rows'])"` returned `500` on current live file (compatible schema retained).
+
+## Plan (Exchange Risk Context + Position Reconciliation - 2026-05-20)
+- [x] Add a read-only Bybit account context helper for wallet, open positions, open orders, recent executions, and closed P&L.
+- [x] Fix strategy position awareness to aggregate all open Nautilus positions for the active instrument instead of using the first cache position.
+- [x] Feed compact account/order/trade risk context into the DeepSeek prompt payload and human prompt.
+- [x] Make position sizing respect actual account context and instrument quantity increments so tiny adjustment orders are skipped safely.
+- [x] Extend the dashboard with direct Bybit exchange portfolio/trade context alongside log-derived Nautilus state.
+- [x] Run compile and focused behavior verification, then capture results here.
+
+## Review (Exchange Risk Context + Position Reconciliation - 2026-05-20)
+- Added `utils/bybit_account_context.py` for signed read-only Bybit V5 GETs: wallet, active position, open orders, executions, and closed P&L.
+- Fixed strategy position context to aggregate multiple Nautilus open positions for the same instrument and override/fallback to Bybit context when Nautilus is missing or materially stale.
+- Added LLM risk context: wallet equity/available balance, exchange position, open orders, and last 5 closed-trade outcomes/P&L.
+- Changed sizing so `fixed_trade_usdt` is now the base target, while confidence/trend/RSI still scale the final notional; caps use exchange equity/available balance when present.
+- Added instrument-increment normalization so sub-`0.01 ETH` adjustment noise is skipped before Nautilus rejects it.
+- Extended dashboard JSON/HTML with direct Bybit portfolio, exchange position, open orders, executions, and closed P&L.
+- Validation:
+  - `python -m py_compile utils/__init__.py utils/bybit_account_context.py utils/deepseek_client.py strategy/deepseek_strategy.py tools/serve_monitor_dashboard.py tests/test_risk_context.py` passed.
+  - `python -m pytest tests/test_risk_context.py -q` passed: 3 tests.
+  - Dashboard direct Bybit snapshot succeeded and showed the live mismatch clearly: log/Nautilus-derived position around `4.69 ETH` short, exchange position around `9.26 ETH` short, open orders `0`, last 5 closed P&L about `-61.22 USDT`.
+  - `npx --yes pyright --pythonpath "$(which python)" ...` ran; remaining failures are pre-existing strategy typing issues in `strategy/deepseek_strategy.py` (optional Nautilus instrument/orderbook/telegram fields and SMA config typing), with the repo config still pointing at `/home/ubuntu/deepseek_venv`.
+
 ## Plan (README Reframe - Solo AI Trading Agent Experiment - 2026-05-17)
 - [x] Audit current README, repo remotes, and local docs for original upstream attribution.
 - [x] Rewrite README around this fork as a solo developer experiment, with clear scope and safety disclaimers.

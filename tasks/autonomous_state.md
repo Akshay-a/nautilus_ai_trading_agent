@@ -13,11 +13,11 @@ This file is owned by the hourly automation. Update it every run.
 - `notes`: one short line
 
 ## Current
-- mode: `VERIFY_PREV_SHIP`
-- last_run_utc: `2026-05-17T01:26:07Z`
+- mode: `BUILD_NEXT`
+- last_run_utc: `2026-05-21T01:47:11Z`
 - last_health: `GREEN`
-- last_shipped_commit: `62d5133`
-- pending_live_verify: `no`
-- pending_live_verify_target: `none`
-- active_backlog_item: `none`
-- notes: `Verified 62d5133 in live feed: running inferred from fresh logs, status coherent, and short sizing remains ~10k notional`
+- last_shipped_commit: `pending`
+- pending_live_verify: `yes`
+- pending_live_verify_target: `pending`
+- active_backlog_item: `B1`
+- notes: `Built B1 by changing feature CSV dumps to append by unseen timestamp; live verify pending commit hash`
