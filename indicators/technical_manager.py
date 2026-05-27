@@ -4,15 +4,18 @@ Technical Indicator Manager for NautilusTrader Strategy
 Manages all technical indicators using NautilusTrader's built-in indicators.
 """
 
-from typing import Dict, Any, List
-from decimal import Decimal
+from typing import Any, Dict, List, Optional, Tuple
+import statistics
 
 from nautilus_trader.indicators import (
-    SimpleMovingAverage,
-    ExponentialMovingAverage,
-    RelativeStrengthIndex,
-    MovingAverageConvergenceDivergence,
     AverageTrueRange,
+    BollingerBands,
+    DirectionalMovement,
+    ExponentialMovingAverage,
+    MovingAverageConvergenceDivergence,
+    MovingAverageType,
+    RelativeStrengthIndex,
+    SimpleMovingAverage,
 )
 from nautilus_trader.model.data import Bar
 
@@ -36,6 +39,8 @@ class TechnicalIndicatorManager:
         bb_std: float = 2.0,
         volume_ma_period: int = 20,
         support_resistance_lookback: int = 20,
+        atr_period: int = 14,
+        directional_movement_period: int = 14,
     ):
         """
         Initialize technical indicator manager.
@@ -62,6 +67,10 @@ class TechnicalIndicatorManager:
             Period for volume moving average
         support_resistance_lookback : int
             Lookback period for support/resistance calculation
+        atr_period : int
+            Period for Average True Range (Nautilus AverageTrueRange, Wilder-style MA).
+        directional_movement_period : int
+            Period for DirectionalMovement (+/- components); DX derived for trend strength.
         """
         # SMA indicators
         self.smas = {period: SimpleMovingAverage(period) for period in sma_periods}
@@ -79,26 +88,79 @@ class TechnicalIndicatorManager:
         )
         self.macd_signal = ExponentialMovingAverage(macd_signal)
 
-        # For Bollinger Bands calculation
-        self.bb_sma = SimpleMovingAverage(bb_period)
+        # Bollinger Bands (Nautilus-native)
+        self.bollinger = BollingerBands(bb_period, bb_std, MovingAverageType.SIMPLE)
         self.bb_period = bb_period
         self.bb_std = bb_std
 
+        self.atr = AverageTrueRange(atr_period, MovingAverageType.WILDER)
+        self.directional_movement = DirectionalMovement(
+            directional_movement_period, MovingAverageType.WILDER
+        )
+
         # Volume MA
         self.volume_sma = SimpleMovingAverage(volume_ma_period)
+        self.volume_ma_period = volume_ma_period
 
         # Store recent bars for calculations
         self.recent_bars: List[Bar] = []
-        self.max_bars = max(list(sma_periods) + [bb_period, volume_ma_period, support_resistance_lookback]) + 10
+        self.max_bars = (
+            max(
+                list(sma_periods)
+                + [
+                    bb_period,
+                    volume_ma_period,
+                    support_resistance_lookback,
+                    atr_period,
+                    directional_movement_period,
+                ]
+            )
+            + 10
+        )
 
         # Configuration
         self.support_resistance_lookback = support_resistance_lookback
+        self.atr_period = atr_period
+        self.directional_movement_period = directional_movement_period
+        # ADX = Wilder-smoothed DX; DX each bar uses Nautilus Wilder +/-DI from DirectionalMovement
+        self._adx_wilder: Optional[float] = None
+        self._dx_seed_buffer: List[float] = []
         self.sma_periods = sma_periods
         self.ema_periods = ema_periods
         self.rsi_period = rsi_period
         self.macd_slow_period = macd_slow
         self.macd_fast_period = macd_fast
         self.macd_signal_period = macd_signal
+
+    def _compute_dmi_dx(self, pos: float, neg: float) -> float:
+        """Directional Index (single-bar) from smoothed +DI/-DI."""
+        total = pos + neg
+        if total <= 1e-12:
+            return 0.0
+        return 100.0 * abs(pos - neg) / total
+
+    def _update_adx_from_directional_movement(self) -> None:
+        """
+        Maintain ADX as Wilder's smoothed DX (same period as DirectionalMovement).
+
+        DX uses Nautilus Wilder-smoothed pos/neg. First ADX is the SMA of the first
+        `period` DX samples; thereafter ADX follows Wilder's recurrence.
+        """
+        if not self.directional_movement.initialized:
+            return
+        pos = float(self.directional_movement.pos)
+        neg = float(self.directional_movement.neg)
+        dx = self._compute_dmi_dx(pos, neg)
+        period = self.directional_movement_period
+        if self._adx_wilder is None:
+            self._dx_seed_buffer.append(dx)
+            if len(self._dx_seed_buffer) >= period:
+                self._adx_wilder = sum(self._dx_seed_buffer) / period
+                self._dx_seed_buffer.clear()
+        else:
+            self._adx_wilder = (
+                self._adx_wilder * (period - 1.0) + dx
+            ) / period
 
     def update(self, bar: Bar):
         """
@@ -114,23 +176,29 @@ class TechnicalIndicatorManager:
         if len(self.recent_bars) > self.max_bars:
             self.recent_bars.pop(0)
 
+        h = float(bar.high)
+        l = float(bar.low)
+        c = float(bar.close)
+
         # Update SMA indicators
         for sma in self.smas.values():
-            sma.update_raw(float(bar.close))
+            sma.update_raw(c)
 
         # Update EMA indicators
         for ema in self.emas.values():
-            ema.update_raw(float(bar.close))
+            ema.update_raw(c)
 
         # Update RSI
-        self.rsi.update_raw(float(bar.close))
+        self.rsi.update_raw(c)
 
         # Update MACD
-        self.macd.update_raw(float(bar.close))
+        self.macd.update_raw(c)
         self.macd_signal.update_raw(self.macd.value)
 
-        # Update Bollinger Band SMA
-        self.bb_sma.update_raw(float(bar.close))
+        self.bollinger.update_raw(h, l, c)
+        self.atr.update_raw(h, l, c)
+        self.directional_movement.update_raw(h, l)
+        self._update_adx_from_directional_movement()
 
         # Update Volume SMA
         self.volume_sma.update_raw(float(bar.volume))
@@ -162,17 +230,41 @@ class TechnicalIndicatorManager:
         macd_value = self.macd.value
         macd_signal_value = self.macd_signal.value  # Signal line from MACD indicator
 
-        # Bollinger Bands
-        bb_middle = self.bb_sma.value
-        bb_std_dev = self._calculate_std_dev(self.bb_period)
-        bb_upper = bb_middle + (self.bb_std * bb_std_dev)
-        bb_lower = bb_middle - (self.bb_std * bb_std_dev)
+        # Bollinger Bands (from Nautilus BollingerBands)
+        bb_upper = float(self.bollinger.upper)
+        bb_middle = float(self.bollinger.middle)
+        bb_lower = float(self.bollinger.lower)
         bb_position = (current_price - bb_lower) / (bb_upper - bb_lower) if bb_upper != bb_lower else 0.5
+
+        atr_val = float(self.atr.value) if self.atr.initialized else 0.0
+        atr_pct = (atr_val / current_price) * 100.0 if current_price else 0.0
+
+        dmi_pos = float(self.directional_movement.pos) if self.directional_movement.initialized else 0.0
+        dmi_neg = float(self.directional_movement.neg) if self.directional_movement.initialized else 0.0
+        dmi_dx = (
+            self._compute_dmi_dx(dmi_pos, dmi_neg)
+            if self.directional_movement.initialized
+            else 0.0
+        )
+        adx_val = (
+            float(self._adx_wilder) if self._adx_wilder is not None else 0.0
+        )
 
         # Volume analysis
         volume_ma = self.volume_sma.value
         current_volume = float(self.recent_bars[-1].volume) if self.recent_bars else 0
         volume_ratio = current_volume / volume_ma if volume_ma > 0 else 1.0
+        # Relative volume alias (backward-compatible name)
+        rvol = volume_ratio
+
+        volumes_tail = [
+            float(b.volume) for b in self.recent_bars[-max(self.volume_ma_period + 5, 15) :]
+        ]
+        volume_zscore, volume_trend_slope = self._volume_zscore_and_slope(volumes_tail, current_volume)
+
+        directional_volume_confirmation, volume_regime = self._classify_directional_volume(
+            current_volume, volume_ma, volume_zscore
+        )
 
         # Support and Resistance
         support, resistance = self._calculate_support_resistance()
@@ -194,13 +286,24 @@ class TechnicalIndicatorManager:
             "macd": macd_value,
             "macd_signal": macd_signal_value,
             "macd_histogram": macd_value - macd_signal_value,
+            "atr": atr_val,
+            "atr_pct": round(atr_pct, 6),
+            "dmi_pos": dmi_pos,
+            "dmi_neg": dmi_neg,
+            "dmi_dx": round(dmi_dx, 6),
+            "adx": round(adx_val, 6),
             # Bollinger Bands
             "bb_upper": bb_upper,
             "bb_middle": bb_middle,
             "bb_lower": bb_lower,
             "bb_position": bb_position,
-            # Volume
+            # Volume (legacy ratio + regime features)
             "volume_ratio": volume_ratio,
+            "rvol": rvol,
+            "volume_zscore": volume_zscore,
+            "volume_trend_slope": volume_trend_slope,
+            "directional_volume_confirmation": directional_volume_confirmation,
+            "volume_regime": volume_regime,
             # Support/Resistance
             "support": support,
             "resistance": resistance,
@@ -210,15 +313,79 @@ class TechnicalIndicatorManager:
 
         return technical_data
 
-    def _calculate_std_dev(self, period: int) -> float:
-        """Calculate standard deviation for Bollinger Bands."""
-        if len(self.recent_bars) < period:
-            return 0.0
+    def _volume_zscore_and_slope(
+        self,
+        volumes: List[float],
+        current_volume: float,
+    ) -> Tuple[float, float]:
+        """Z-score vs recent-volume distribution and OLS slope of last few bars."""
+        if len(volumes) < 3:
+            return 0.0, 0.0
+        hist = volumes[:-1] if len(volumes) > 1 else volumes
+        if len(hist) < 2:
+            return 0.0, 0.0
+        try:
+            mu = statistics.mean(hist)
+            sigma = statistics.pstdev(hist)
+        except statistics.StatisticsError:
+            return 0.0, 0.0
+        z = (current_volume - mu) / sigma if sigma > 1e-12 else 0.0
 
-        recent_closes = [float(bar.close) for bar in self.recent_bars[-period:]]
-        mean = sum(recent_closes) / len(recent_closes)
-        variance = sum((x - mean) ** 2 for x in recent_closes) / len(recent_closes)
-        return variance ** 0.5
+        tail = volumes[-min(12, len(volumes)) :]
+        if len(tail) < 2:
+            return z, 0.0
+        xs = list(range(len(tail)))
+        x_mean = statistics.mean(xs)
+        y_mean = statistics.mean(tail)
+        num = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, tail))
+        den = sum((x - x_mean) ** 2 for x in xs)
+        slope = num / den if den > 1e-18 else 0.0
+        return round(z, 4), round(slope, 6)
+
+    def _classify_directional_volume(
+        self,
+        current_volume: float,
+        volume_ma: float,
+        volume_zscore: float,
+    ) -> Tuple[str, str]:
+        """Directional confirmation label + coarse volume regime."""
+        if not self.recent_bars:
+            return "insufficient_history", "normal"
+
+        bar = self.recent_bars[-1]
+        o = float(bar.open)
+        cl = float(bar.close)
+        body_dir = 0
+        if cl > o:
+            body_dir = 1
+        elif cl < o:
+            body_dir = -1
+
+        vma = volume_ma if volume_ma > 0 else 1.0
+        vol_excess = (current_volume - vma) / vma
+
+        confirmation = "neutral"
+        if body_dir > 0 and vol_excess > 0.25:
+            confirmation = "bullish_volume_confirmed"
+        elif body_dir < 0 and vol_excess > 0.25:
+            confirmation = "bearish_volume_confirmed"
+        elif body_dir != 0 and vol_excess < -0.2:
+            confirmation = "weak_volume_drift"
+
+        zs = float(volume_zscore)
+        if zs < -0.75:
+            regime = "low"
+        elif zs < 1.25:
+            regime = "normal"
+        elif zs < 2.5:
+            regime = "high"
+        else:
+            regime = "climactic"
+
+        if body_dir == 0 and regime == "climactic":
+            regime = "high"
+
+        return confirmation, regime
 
     def _calculate_support_resistance(self) -> tuple:
         """Calculate support and resistance levels."""
@@ -249,22 +416,16 @@ class TechnicalIndicatorManager:
         sma_20 = sma_values.get('sma_20', current_price)
         sma_50 = sma_values.get('sma_50', current_price)
 
-        # Short-term trend (price vs SMA20)
-        short_term_trend = "上涨" if current_price > sma_20 else "下跌"
-
-        # Medium-term trend (price vs SMA50)
-        medium_term_trend = "上涨" if current_price > sma_50 else "下跌"
-
-        # MACD trend
+        short_term_trend = "up" if current_price > sma_20 else "down"
+        medium_term_trend = "up" if current_price > sma_50 else "down"
         macd_trend = "bullish" if macd_value > macd_signal_value else "bearish"
 
-        # Overall trend
-        if short_term_trend == "上涨" and medium_term_trend == "上涨":
-            overall_trend = "强势上涨"
-        elif short_term_trend == "下跌" and medium_term_trend == "下跌":
-            overall_trend = "强势下跌"
+        if short_term_trend == "up" and medium_term_trend == "up":
+            overall_trend = "strong_up"
+        elif short_term_trend == "down" and medium_term_trend == "down":
+            overall_trend = "strong_down"
         else:
-            overall_trend = "震荡整理"
+            overall_trend = "mixed"
 
         return {
             'short_term_trend': short_term_trend,
@@ -278,10 +439,12 @@ class TechnicalIndicatorManager:
         # Check if we have minimum bars for key indicators
         # Use dynamic calculation based on actual indicator periods
         min_required_bars = max(
-            self.rsi_period,  # RSI period (e.g., 7 or 14)
-            self.macd_slow_period,  # MACD slow period (e.g., 10 or 26)
-            self.bb_period,  # Bollinger Bands period (e.g., 10 or 20)
-            min(self.sma_periods) if self.sma_periods else 0  # At least shortest SMA
+            self.rsi_period,
+            self.macd_slow_period,
+            self.bb_period,
+            self.atr_period,
+            self.directional_movement_period,
+            min(self.sma_periods) if self.sma_periods else 0,
         )
         
         if len(self.recent_bars) < min_required_bars:
@@ -292,6 +455,15 @@ class TechnicalIndicatorManager:
             return False
 
         if not self.macd.initialized:
+            return False
+
+        if not self.bollinger.initialized:
+            return False
+
+        if not self.atr.initialized:
+            return False
+
+        if not self.directional_movement.initialized:
             return False
 
         # Check if we have at least one SMA initialized (for trend analysis)

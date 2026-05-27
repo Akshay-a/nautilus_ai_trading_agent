@@ -17,7 +17,7 @@ import csv
 import math
 import os
 import statistics
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -439,17 +439,15 @@ class OrderBookManager:
     # -- 2c helpers --
 
     def _compute_trade_window_features(
-        self, now_ns: int
+        self, now_ns: int, window_ns: Optional[int] = None,
     ) -> Tuple[float, float, int, int, int, int, float, float, float]:
         """
         Compute trade-window features in one traversal.
 
-        Returns:
-            buy_vol, sell_vol, buy_count, sell_count,
-            sweep_buy_count, sweep_sell_count, sweep_buy_vol, sweep_sell_vol,
-            recent_vwap
+        window_ns overrides the rolling trade window duration (defaults to configured value).
         """
-        cutoff = now_ns - self._trade_window_ns
+        eff_window = window_ns if window_ns is not None else self._trade_window_ns
+        cutoff = now_ns - eff_window
         recent: List[TradeRecord] = []
         for t in reversed(self._trade_buf):
             if t.ts_event < cutoff:
@@ -590,6 +588,201 @@ class OrderBookManager:
             "depth_updates": self.depth_updates_received,
             "trade_ticks": self.trade_ticks_received,
         }
+
+    # ------------------------------------------------------------------
+    # Timeframe-aware rolling windows (trade + depth snapshots)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _spread_percentile(sorted_spreads: List[float], pct: float) -> float:
+        if not sorted_spreads:
+            return 0.0
+        n = len(sorted_spreads)
+        idx = max(0, min(n - 1, int(round((n - 1) * pct))))
+        return sorted_spreads[idx]
+
+    def _aggregate_ob_window(self, now_ns: int, window_sec: float) -> Dict[str, Any]:
+        """
+        Aggregate Phase-2 footprint stats over `[now - window, now]` from depth-derived features.
+        Uses `microprice_vs_mid_bps_avg` instead of instantaneous microprice-vs-mid.
+        """
+        if now_ns <= 0:
+            lf = self.latest_features
+            if lf is None:
+                return {"ready": False}
+            now_ns = lf.ts
+
+        window_ns = max(1, int(round(float(window_sec) * 1e9)))
+        feats = [f for f in self._feature_buf if f.ts >= now_ns - window_ns]
+
+        trade_ns = window_ns
+        (
+            buy_vol,
+            sell_vol,
+            buy_cnt,
+            sell_cnt,
+            sb_cnt,
+            ss_cnt,
+            sb_vol,
+            ss_vol,
+            recent_vwap,
+        ) = self._compute_trade_window_features(now_ns, window_ns=trade_ns)
+        denom = buy_vol + sell_vol
+        trade_flow_imbalance = (buy_vol - sell_vol) / denom if denom > 0 else 0.0
+        sw_total = sb_cnt + ss_cnt
+        sweep_imbalance = ((sb_cnt - ss_cnt) / sw_total) if sw_total > 0 else 0.0
+
+        if not feats:
+            return {
+                "ready": bool(self.latest_features),
+                "window_sec": round(window_sec, 6),
+                "n_snapshots": 0,
+                "trade_flow_imbalance": round(trade_flow_imbalance, 4),
+                "sweep_imbalance": round(sweep_imbalance, 4),
+                "normalized_ofi_score": 0.0,
+                "depth_regime_proportions": {},
+                "microprice_vs_mid_bps_avg": 0.0,
+                "spread_mean_bps": 0.0,
+                "spread_p95_bps": 0.0,
+                "spread_vol": 0.0,
+                "recent_vwap": round(recent_vwap, 2),
+            }
+
+        spreads = [f.spread_bps for f in feats]
+        spreads_sorted = sorted(spreads)
+        spread_mean = statistics.mean(spreads)
+        spread_p95 = self._spread_percentile(spreads_sorted, 0.95)
+        spread_vol = statistics.pstdev(spreads) if len(spreads) >= 5 else (
+            spreads[-1] - spreads[0] if spreads else 0.0
+        )
+
+        regimes = Counter(f.depth_regime for f in feats)
+        denom_r = sum(regimes.values()) or 1
+        proportions = {
+            str(k): round(v / denom_r, 4)
+            for k, v in sorted(regimes.items(), key=lambda x: -x[1])
+        }
+
+        micro_devs_bps = []
+        for f in feats:
+            if f.mid > 1e-12:
+                micro_devs_bps.append(((f.microprice - f.mid) / f.mid) * 10_000.0)
+        micro_mid_bps = statistics.mean(micro_devs_bps) if micro_devs_bps else 0.0
+
+        ofis = [f.ofi for f in feats]
+        of_mean = statistics.mean(ofis)
+        try:
+            of_sigma = statistics.pstdev(ofis) if len(ofis) >= 2 else abs(of_mean) + 1e-9
+        except statistics.StatisticsError:
+            of_sigma = 1e-9
+        norm_ofi_raw = of_mean / (of_sigma + 1e-9)
+        normalized_ofi = max(-3.0, min(3.0, norm_ofi_raw)) / 3.0
+
+        agg = {
+            "ready": True,
+            "window_sec": round(window_sec, 6),
+            "n_snapshots": len(feats),
+            "spread_mean_bps": round(spread_mean, 4),
+            "spread_p95_bps": round(spread_p95, 4),
+            "spread_vol": round(spread_vol, 6),
+            "depth_regime_proportions": proportions,
+            "normalized_ofi_score": round(normalized_ofi, 4),
+            "trade_flow_imbalance": round(trade_flow_imbalance, 4),
+            "sweep_imbalance": round(sweep_imbalance, 4),
+            "microprice_vs_mid_bps_avg": round(micro_mid_bps, 4),
+            "recent_vwap": round(recent_vwap, 2),
+        }
+        agg["labels"] = self._compress_micro_labels(feats, agg, proportions)
+        return agg
+
+    @staticmethod
+    def _compress_micro_labels(
+        feats: List["MicrostructureFeatures"],
+        aggregates: Dict[str, Any],
+        proportions: Dict[str, Any],
+    ) -> Dict[str, str]:
+        """Low-cardinality summaries for prompting / CSV."""
+        thin_p = proportions.get("thin", 0.0)
+        thick_p = proportions.get("thick", 0.0)
+        normal_p = proportions.get("normal", 0.0)
+        spread_mean = float(aggregates.get("spread_mean_bps") or 0)
+        spread_p95 = float(aggregates.get("spread_p95_bps") or 0)
+        spread_vol = float(aggregates.get("spread_vol") or 0)
+
+        # Orchestration vocab: thin | normal | thick (same branching as legacy easy/stressed/neutral).
+        if spread_mean <= 8 and spread_p95 <= 15 and thin_p <= 0.25:
+            liquidity = "thick"
+        elif spread_mean >= 35 or spread_p95 >= 55 or thin_p >= 0.55:
+            liquidity = "thin"
+        else:
+            liquidity = "normal"
+
+        if thin_p >= 0.45 or spread_vol >= max(2.5, spread_mean * 0.35 + 0.5):
+            friction = "high"
+        elif spread_vol <= max(1.0, spread_mean * 0.12 + 0.3) and thin_p <= 0.2:
+            friction = "low"
+        else:
+            friction = "medium"
+
+        tfs = [f.trade_flow_imbalance for f in feats]
+        tobs = [f.tob_imbalance for f in feats]
+        tf_m = statistics.mean(tfs) if tfs else 0.0
+        tob_m = statistics.mean(tobs) if tobs else 0.0
+        bias = (tf_m + tob_m) / 2.0
+        if bias > 0.12:
+            directional_pressure = "buy_heavy"
+        elif bias < -0.12:
+            directional_pressure = "sell_heavy"
+        else:
+            directional_pressure = "neutral"
+
+        of_m = statistics.mean([f.ofi for f in feats])
+        absorption = (
+            "yes" if (
+                (of_m > 0 and tf_m < -0.06) or (of_m < 0 and tf_m > 0.06)
+            ) else "no"
+        )
+
+        if thin_p >= 0.33 and thick_p >= 0.33:
+            regime_shift = "transitioning"
+        elif max(thin_p, thick_p, normal_p) <= 0.55:
+            regime_shift = "transitioning"
+        else:
+            regime_shift = "stable"
+
+        return {
+            "liquidity": liquidity,
+            "friction": friction,
+            "directional_pressure": directional_pressure,
+            "absorption": absorption,
+            "regime_shift": regime_shift,
+        }
+
+    def get_tf_window_summaries(self, bar_period_sec: int, now_ns: int = 0) -> Dict[str, Any]:
+        """
+        Produce `fast` (~60s), `main` (bar TF), `context` (3x TF) window summaries aligned to candles.
+
+        `bar_period_sec` is the cadence implied by strategy bar_type (converted to integer seconds ≥ 60).
+        """
+        f = self.latest_features
+        if f is None:
+            return {"ready": False}
+
+        wf = 60
+        wm = max(60, int(bar_period_sec))
+        wc = wm * 3
+        anchor = now_ns if now_ns and now_ns > 0 else int(f.ts)
+        root = {
+            "ready": True,
+            "W_fast_sec": wf,
+            "W_main_sec": wm,
+            "W_context_sec": wc,
+            "anchor_ts_event": anchor,
+            "fast": self._aggregate_ob_window(anchor, wf),
+            "main": self._aggregate_ob_window(anchor, wm),
+            "context": self._aggregate_ob_window(anchor, wc),
+        }
+        return root
 
     def get_depth_profile(self, levels: int = 5) -> Dict[str, Any]:
         snap = self.latest_depth

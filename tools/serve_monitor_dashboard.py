@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from glob import glob
@@ -26,13 +27,18 @@ LOG_DIR = ROOT / "logs"
 ENV_FILE = ROOT / ".env"
 PID_FILE = ROOT / "trader.pid"
 
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from utils.bybit_account_context import BybitAccountContextFetcher
+
 RE_SIGNAL = re.compile(
     r"🤖 Signal:\s*(BUY|SELL|HOLD)\s*\|\s*Confidence:\s*(LOW|MEDIUM|HIGH)\s*\|\s*API time:\s*([0-9.]+)s\s*\|\s*Reason:\s*(.*)"
 )
 RE_PRICE = re.compile(r"Current Price:\s*\$([0-9,]+(?:\.[0-9]+)?)")
 RE_RSI = re.compile(r"RSI:\s*([0-9]+(?:\.[0-9]+)?)")
 RE_POSITION_CURRENT = re.compile(
-    r"Current Position:\s*(long|short)\s*([0-9.]+)\s*@\s*\$([0-9,]+(?:\.[0-9]+)?)",
+    r"Current Position:\s*(long|short)\s*([0-9.]+)(?:\s+[A-Z]+)?\s*@\s*\$([0-9,]+(?:\.[0-9]+)?)",
     re.IGNORECASE,
 )
 RE_POSITION_OPENED = re.compile(
@@ -95,6 +101,52 @@ def _parse_env_file(path: Path) -> Dict[str, str]:
         val = val.strip().strip("'").strip('"')
         values[key] = val
     return values
+
+
+def _collect_bybit_exchange_context(env_cfg: Dict[str, str], instrument_id: str) -> Dict[str, Any]:
+    """
+    Fetch direct read-only Bybit context for portfolio/order/trade visibility.
+
+    The dashboard should make exchange/log mismatches obvious instead of hiding
+    behind log-derived state only.
+    """
+    fetcher = BybitAccountContextFetcher.from_env(
+        instrument_id=instrument_id,
+        env=env_cfg,
+    )
+    if fetcher is None:
+        return {
+            "ok": False,
+            "errors": [{"error": "BYBIT_API_KEY/BYBIT_API_SECRET not configured"}],
+            "wallet": None,
+            "position": None,
+            "open_orders": [],
+            "recent_executions": [],
+            "recent_closed_pnl": [],
+            "recent_trade_summary": {},
+        }
+
+    try:
+        return fetcher.fetch()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "source": "bybit_v5",
+            "mode": {
+                "demo": fetcher.demo,
+                "testnet": fetcher.testnet,
+                "endpoint": fetcher.base_url,
+            },
+            "instrument_id": instrument_id,
+            "symbol": fetcher.symbol,
+            "errors": [{"error": f"{type(exc).__name__}: {exc}"}],
+            "wallet": None,
+            "position": None,
+            "open_orders": [],
+            "recent_executions": [],
+            "recent_closed_pnl": [],
+            "recent_trade_summary": {},
+        }
 
 
 def _strategy_process_state() -> Dict[str, Any]:
@@ -428,12 +480,14 @@ def collect_status() -> Dict[str, Any]:
         "dry_run": env_cfg.get("DRY_RUN", "").lower() == "true",
         "instrument_id": env_cfg.get("INSTRUMENT_ID", "BTCUSDT-LINEAR.BYBIT"),
     }
+    exchange = _collect_bybit_exchange_context(env_cfg, mode["instrument_id"])
 
     status = {
         "now_utc": now_utc,
         "process": proc,
         "mode": mode,
         "metrics": metrics,
+        "exchange": exchange,
     }
     return status
 
@@ -442,8 +496,12 @@ def _render_html(status: Dict[str, Any]) -> str:
     mode = status["mode"]
     proc = status["process"]
     m = status["metrics"]
+    ex = status.get("exchange") or {}
     sig = m["last_signal"] or {"signal": "N/A", "confidence": "N/A"}
     pos = m["open_position"]
+    ex_wallet = ex.get("wallet") or {}
+    ex_position = ex.get("position")
+    ex_trade_summary = ex.get("recent_trade_summary") or {}
 
     pos_html = (
         f"<b>{pos['side']}</b> {pos['quantity']:.6f} BTC"
@@ -455,6 +513,17 @@ def _render_html(status: Dict[str, Any]) -> str:
     last_rsi = f"{m['last_rsi']:.2f}" if isinstance(m["last_rsi"], (int, float)) else "N/A"
     pnl = f"{m['realized_pnl_usdt']:.2f}"
     running = "RUNNING" if proc["running"] else "STOPPED"
+    ex_pos_html = (
+        f"<b>{str(ex_position.get('side', '')).upper()}</b> {ex_position.get('quantity')} "
+        f"{(ex.get('symbol') or '')} @ ${ex_position.get('avg_price'):,.2f} "
+        f"| uPnL {ex_position.get('unrealized_pnl')}"
+        if ex_position and isinstance(ex_position.get("avg_price"), (int, float))
+        else "No exchange position"
+    )
+    ex_equity = ex_wallet.get("total_equity")
+    ex_available = ex_wallet.get("total_available_balance")
+    ex_margin = ex_wallet.get("total_initial_margin")
+    ex_pnl_5 = ex_trade_summary.get("last_5_realized_pnl")
 
     return f"""<!doctype html>
 <html>
@@ -530,6 +599,16 @@ def _render_html(status: Dict[str, Any]) -> str:
         <div class="v">{pnl} USDT</div>
         <div class="small">Closed trades: {m["closed_trades"]} | DeepSeek calls: {m["deepseek_calls"]}</div>
       </div>
+      <div class="card">
+        <div class="k">Bybit Portfolio</div>
+        <div class="v">{f'${ex_equity:,.2f}' if isinstance(ex_equity, (int, float)) else 'N/A'}</div>
+        <div class="small">Available: {f'${ex_available:,.2f}' if isinstance(ex_available, (int, float)) else 'N/A'} | Initial margin: {f'${ex_margin:,.2f}' if isinstance(ex_margin, (int, float)) else 'N/A'}</div>
+      </div>
+      <div class="card">
+        <div class="k">Bybit Position</div>
+        <div class="v">{ex_pos_html}</div>
+        <div class="small">Open orders: {len(ex.get("open_orders") or [])} | Last 5 P&L: {f'{ex_pnl_5:.2f} USDT' if isinstance(ex_pnl_5, (int, float)) else 'N/A'}</div>
+      </div>
     </div>
 
     <div class="grid" style="margin-top:12px">
@@ -540,6 +619,10 @@ def _render_html(status: Dict[str, Any]) -> str:
       <div class="card">
         <div class="k">Recent Important Events</div>
         <ul id="events"></ul>
+      </div>
+      <div class="card">
+        <div class="k">Bybit Recent Closed P&L</div>
+        <ul id="closed_pnl"></ul>
       </div>
     </div>
 
@@ -560,11 +643,14 @@ def _render_html(status: Dict[str, Any]) -> str:
     const warns = status.metrics.recent_warnings_errors || [];
     const events = status.metrics.recent_events || [];
     const llmConvos = status.metrics.llm_conversations || [];
+    const closedPnl = (status.exchange && status.exchange.recent_closed_pnl) || [];
     const warnList = document.getElementById("warns");
     const eventList = document.getElementById("events");
+    const pnlList = document.getElementById("closed_pnl");
     const llmConvosEl = document.getElementById("llm_convos");
     warnList.innerHTML = warns.slice(-8).reverse().map(x => `<li>[${{x.level}}] ${{x.message}}</li>`).join("") || "<li>None</li>";
     eventList.innerHTML = events.slice(-8).reverse().map(x => `<li>${{x.message}}</li>`).join("") || "<li>None</li>";
+    pnlList.innerHTML = closedPnl.slice(0, 5).map(x => `<li>${{x.outcome}} ${{x.side}} ${{x.quantity}} | ${{x.closed_pnl}} USDT</li>`).join("") || "<li>None</li>";
     llmConvosEl.innerHTML = llmConvos.slice(-5).reverse().map(c => {{
       const prompt = c.prompt_payload ? JSON.stringify(c.prompt_payload) : "N/A";
       const response = c.response_json ? JSON.stringify(c.response_json) : (c.response_raw || "N/A");

@@ -122,7 +122,7 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         'MAX_POSITION_RATIO',
         str(strategy_yaml.get('position_management', {}).get('max_position_ratio', '0.10')),
     )
-    timeframe = get_env_str('TIMEFRAME', '1m')  # Fast loop default for demo iteration
+    timeframe = get_env_str('TIMEFRAME', '5m')
     instrument_id = get_env_str(
         'INSTRUMENT_ID',
         str(strategy_yaml.get('instrument_id', 'BTCUSDT-LINEAR.BYBIT')),
@@ -228,7 +228,7 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         orderbook_log_min_seconds=strategy_yaml.get('orderbook', {}).get('log_min_seconds', 60),
 
         # Timing - Load from YAML config (default: 900 seconds = 15 minutes)
-        timer_interval_sec=get_env_int('TIMER_INTERVAL_SEC', str(strategy_yaml.get('timer_interval_sec', 900))),
+        timer_interval_sec=get_env_int('TIMER_INTERVAL_SEC', str(strategy_yaml.get('timer_interval_sec', 300))),
         warmup_bars=get_env_int('WARMUP_BARS', str(strategy_yaml.get('warmup_bars', 200))),
         
         # Telegram Notifications

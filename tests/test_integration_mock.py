@@ -172,7 +172,7 @@ def test_full_flow_binance_to_order():
     print("✅ INTEGRATION TEST PASSED")
     print("="*70)
 
-    return mock_order
+    assert mock_order["type"] == "BRACKET"
 
 
 def test_rejected_order_scenario():
