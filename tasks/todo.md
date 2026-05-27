@@ -1,5 +1,185 @@
 # TODO
 
+## Plan (TA Migration + 5m Cadence + Prompt Minimization - 2026-05-27)
+- [x] Audit current TechnicalIndicatorManager for remaining hand-rolled computations and identify Nautilus-native replacements.
+- [x] Delegate implementation via Cursor CLI: add ATR + ADX-style trend-strength features, switch remaining TA components to Nautilus indicators, keep TechnicalManager thin.
+- [x] Delegate implementation via Cursor CLI: switch live defaults to 5m cadence (`TIMEFRAME=5m`, `TIMER_INTERVAL_SEC=300`) in production startup/config path.
+- [x] Delegate implementation via Cursor CLI: minimize LLM prompt instructions and formatting overhead while preserving strict JSON schema.
+- [x] Run compile + focused tests and dry runtime validation to verify no regressions in signal loop, indicator readiness, and journal output fields.
+- [x] Produce quant-style verification summary and residual risks.
+
+## Review (TA Migration + 5m Cadence + Prompt Minimization - 2026-05-27)
+- Delegated implementation to Cursor CLI in two passes (primary change-set + targeted ADX field follow-up), then re-verified locally.
+- Technical manager modernization:
+  - Replaced manual Bollinger computation with Nautilus `BollingerBands`.
+  - Added Nautilus `AverageTrueRange` and `DirectionalMovement`.
+  - Added explicit volatility/trend-strength outputs: `atr`, `atr_pct`, `dmi_pos`, `dmi_neg`, `dmi_dx`, `adx`.
+  - Kept manager as aggregation layer; preserved existing key outputs for compatibility.
+- 5-minute trading cadence defaults:
+  - `main_live.py` default `TIMEFRAME` changed to `5m`.
+  - default `TIMER_INTERVAL_SEC` fallback changed to `300`.
+  - `start_trader.sh` exports changed to `TIMEFRAME=5m`, `TIMER_INTERVAL_SEC=300`.
+  - `configs/strategy_config.yaml` default `bar_type` changed to `...-5-MINUTE-...` and `timer_interval_sec: 300`.
+- Prompt minimization:
+  - System prompt simplified to compact role + strict JSON-only requirement.
+  - User prompt significantly compressed (data-first, concise schema reminder, reduced behavioral forcing).
+  - Added `atr/adx` into compact technical payload presented to LLM.
+- Verification:
+  - `python3 -m py_compile indicators/technical_manager.py utils/deepseek_client.py main_live.py strategy/deepseek_strategy.py` passed.
+  - `pytest tests/test_strategy_components.py tests/test_integration_mock.py -q` passed (`9 passed`).
+  - Runtime smoke boot confirmed 5m path:
+    - `Sentiment fetcher initialized with timeframe: 5m`
+    - `Pre-fetching ... interval=5m`
+    - `SubscribeBars(...-5-MINUTE-LAST-EXTERNAL)`
+
+## Plan (Live E2E Verification - LLM -> Decision -> Order Trigger - 2026-05-27)
+- [x] Start trader process in the configured live demo mode and confirm process health.
+- [x] Capture runtime logs proving outbound LLM call attempts and returned model decision payload.
+- [x] Verify the strategy converts model output into a concrete trade decision path (BUY/SELL/HOLD + confidence).
+- [x] Verify an order trigger event is emitted from that decision path (submit/skip/reject reason captured in logs).
+- [x] Summarize evidence with exact timestamps and pass/fail per stage.
+
+## Review (Live E2E Verification - LLM -> Decision -> Order Trigger - 2026-05-27)
+- Executed foreground live run via `zsh -ic 'python main_live.py'` (startup through `RUNNING` confirmed).
+- Bar-close decision cycles observed:
+  - `2026-05-26T23:37:00Z`: `📌 Bar-close synth` -> `Calling DeepSeek AI (bar-aligned synthesis)` -> valid `LLM Response JSON` -> `🤖 Signal: HOLD | Confidence: LOW`.
+  - `2026-05-26T23:38:00Z`: same full LLM path with valid JSON response and `HOLD | LOW`.
+- Execution path verification:
+  - Both cycles hit risk gate: `Signal confidence LOW below minimum MEDIUM, skipping trade`.
+  - No `Submitted ... order` / `Submitted bracket order` lines were emitted in these validated cycles.
+  - Trade journal rows confirm execution outcome as skipped (`execution_status=skipped`, note `confidence_below_min:LOW<MEDIUM`).
+- Verdict for requested chain:
+  - LLM calls flowing: `PASS`.
+  - LLM decision produced: `PASS`.
+  - Order triggered from decision: `FAIL (not triggered in this run window due to confidence gate)`.
+
+## Review (Live Re-Validation After zshrc Typo Fix - 2026-05-27)
+- Interactive shell check (`zsh -ic`) now confirms all required vars resolve: `BYBIT_API_KEY`, `BYBIT_API_SECRET`, `DEEPSEEK_API_KEY`.
+- Fresh live run executed with `zsh -ic 'python main_live.py'`:
+  - Strategy reached `RUNNING`.
+  - Bar-close trigger fired at `2026-05-26T23:00:00Z` and `2026-05-26T23:01:00Z`.
+  - Timer remained ops-only: `⏲️ Ops timer: maintenance (no standalone LLM call).`
+- Journal validation from latest rows in `logs/trade_journal.csv`:
+  - `decision_cycle_trigger=on_bar`
+  - timing fields populated (`bar_close_ts`, `decision_ts`, `execution_ts`, `latency_ms`)
+  - volume fields populated (`rvol`, `volume_zscore`, `volume_trend_slope`, `technical_volume_regime`, `directional_volume_confirmation`)
+  - OB window payloads populated (`ob_window_fast_json`, `ob_window_main_json`, `ob_window_context_json`)
+  - fallback reasoning captured (`reasoning_content=fallback_default_no_model_output`)
+- Remaining blocker unchanged: DeepSeek API responses still return `402 Insufficient Balance`, so strategy falls back to `HOLD/LOW`.
+- Shell warning still present from `.zshrc`: missing sourced file `/Users/akshayapsingi/.openclaw/completions/openclaw.zsh`.
+
+## Review (Live Re-Validation After zshrc Update - 2026-05-27)
+- Re-validated using interactive shell (`zsh -ic`) after user refreshed `~/.zshrc`.
+- Runtime `python main_live.py` live run proved env/key wiring + strategy startup path:
+  - Bybit clients initialized and strategy reached `RUNNING`.
+  - Bar-aligned trigger fired (`📌 Bar-close synth @ ...`).
+  - Timer remained ops-only (`⏲️ Ops timer: maintenance (no standalone LLM call).`).
+  - DeepSeek call path active but still returns `402 Insufficient Balance`; fallback held (`HOLD/LOW`).
+- Latest journal row in `logs/trade_journal.csv` validated:
+  - `decision_cycle_trigger=on_bar`
+  - populated timing (`bar_close_ts`, `decision_ts`, `execution_ts`, `latency_ms`)
+  - populated volume (`rvol`, `volume_zscore`, `volume_trend_slope`, `technical_volume_regime`, `directional_volume_confirmation`)
+  - populated OB windows (`ob_window_fast_json`, `ob_window_main_json`, `ob_window_context_json`)
+  - fallback reasoning capture present (`reasoning_content=fallback_default_no_model_output`)
+- Operational caveat:
+  - In this Codex execution environment, detached `nohup` children are reclaimed after command return, so `start_trader.sh` appears to return an ephemeral PID with an empty new log. Foreground live run is healthy.
+  - `.zshrc` still logs `exprt` typo and missing `/Users/akshayapsingi/.openclaw/completions/openclaw.zsh`.
+
+## Plan (Live Deploy Validation - 2026-05-27)
+- [x] Validate runtime prerequisites after user refreshed zsh env.
+- [x] Restart trader in live mode and verify process health after bootstrap.
+- [x] Verify bar-aligned decision loop and ops-only timer behavior from fresh logs.
+- [x] Verify latest journal row includes timing, reasoning, OB-window, and volume-regime fields.
+
+## Review (Live Deploy Validation - 2026-05-27)
+- Deployment executed with `zsh -ic './start_trader.sh'` (fresh process `PID 67595`).
+- Runtime health confirmed after 75s hold:
+  - process alive (`python main_live.py`).
+  - bar-close cycle emitted (`📌 Bar-close synth ...`).
+  - timer emitted ops-only message (`⏲️ Ops timer: maintenance (no standalone LLM call)`).
+- LLM calls still returning `402 Insufficient Balance` from DeepSeek API, strategy correctly falls back to `HOLD LOW`.
+- Journal integrity confirmed from latest row in `logs/trade_journal.csv`:
+  - `decision_cycle_trigger=on_bar`
+  - timing fields populated (`bar_close_ts`, `decision_ts`, `execution_ts`, `latency_ms`)
+  - `reasoning_content=fallback_default_no_model_output`
+  - volume + OB window fields populated (`rvol`, `volume_zscore`, `volume_trend_slope`, `technical_volume_regime`, `ob_window_*_json`).
+- Noted shell issue from user zsh startup:
+  - `.zshrc:20` has `exprt` typo (should be `export`).
+  - missing sourced file warning for `/Users/akshayapsingi/.openclaw/completions/openclaw.zsh`.
+
+## Plan (Production Upgrade + Validation Cycle - 2026-05-27)
+- [x] Recon baseline behavior and schema gaps for trigger flow, prompt architecture, OB windows, and journal fields.
+- [x] Delegate implementation to Cursor: move decision trigger to `on_bar`, keep `on_timer` ops-only, and preserve non-signal maintenance behavior.
+- [x] Delegate implementation to Cursor: add timeframe-aware OB windows (`W_fast=60s`, `W_main=TF`, `W_context=3xTF`) with compact regime labels for LLM + CSV.
+- [x] Delegate implementation to Cursor: add volume regime features (`rvol`, `volume_zscore`, `volume_trend_slope`, directional confirmation, regime labels).
+- [x] Delegate implementation to Cursor: refactor DeepSeek prompt/schema from weighted rules-engine style to synthesis-engine style with concise output fields.
+- [x] Delegate implementation to Cursor: harden trade journal row contract (single decision row per cycle, robust `reasoning_content`, latency/timing + compact JSON snapshots).
+- [x] Run compile + focused tests and capture deterministic pass/fail output.
+- [x] Run dry-run validation (5m + 15m mode) with evidence pack: bar-aligned triggers, CSV append/header behavior, OB window population, volume fields, reasoning capture, and latency.
+- [x] Produce quant verdict (`PASS|CONDITIONAL PASS|FAIL`) with residual risks and next action.
+- [x] Produce execution-minimal autonomous prompt (~35% shorter), save it to automation target, and verify it executes correctly.
+
+## Check-In (Production Upgrade + Validation Cycle - 2026-05-27)
+- Bar-close `_run_bar_close_decision_cycle` wired from `on_bar`; `on_timer` is ops-only (risk refresh, trailing, OCO, OB CSV append).
+- Analyzer prompt/schema migrated to synthesis format; fallback now emits non-empty `reasoning_content` markers.
+- OB windows + labels and volume regime fields are present in runtime payloads and journal rows.
+- `python3 -m py_compile` passes for updated strategy/prompt/journal/indicator/tests modules.
+- `pytest tests/test_strategy_components.py tests/test_integration_mock.py` passes: `9 passed`.
+
+## Review (Production Upgrade + Validation Cycle - 2026-05-27)
+- Runtime evidence captured from `logs/stage_validation_1m_20260527_012539.log` and `logs/stage_validation_1m_b_20260527_013108.log` shows:
+  - `on_bar` drives decisions (`📌 Bar-close synth ...`, followed by `Calling DeepSeek AI (bar-aligned synthesis)...`).
+  - `on_timer` is maintenance-only (`⏲️ Ops timer: maintenance (no standalone LLM call).`).
+- CSV evidence:
+  - `logs/trade_journal_scope_1m.csv` and `logs/trade_journal_scope_1m_b.csv` each created with a single header and append rows only.
+  - Timing fields populated: `bar_close_ts_utc/bar_close_ts`, `decision_ts_utc/decision_ts`, `execution_ts_utc/execution_ts`, `latency_ms`.
+  - Volume fields populated: `rvol`, `volume_zscore`, `volume_trend_slope`, `directional_volume_confirmation`, `technical_volume_regime`.
+  - OB windows populated in each row: `ob_window_fast_json`, `ob_window_main_json`, `ob_window_context_json`.
+  - Fallback reasoning capture verified as non-empty (`fallback_default_no_model_output`).
+- Timeframe window policy validation:
+  - Synthetic manager check confirms 5m -> `W_fast/W_main/W_context = 60/300/900`.
+  - Synthetic manager check confirms 15m -> `W_fast/W_main/W_context = 60/900/2700`.
+- Automation:
+  - Added execution-minimal run prompt file: `/Users/akshayapsingi/Projects/nautilus_ai_trading_agent/tasks/autonomous_daily_prompt_minimal.md`.
+  - Created automation `nautilus-daily-validation-minimal` (daily heartbeat) and successfully rendered it via `view`.
+
+## Plan (Desk Summary - Current Data / Features / LLM Perception - 2026-05-22)
+- [x] Trace the current runtime cadence and active data path from strategy timer, bar feed, and order-book subscriptions.
+- [x] Extract the exact feature sets from technical, microstructure, sentiment, and risk-context layers.
+- [x] Summarize how the LLM currently receives and weights each information source, including known limitations around timeframe alignment.
+- [x] Record the desk-facing summary for sharing.
+
+## Review (Desk Summary - Current Data / Features / LLM Perception - 2026-05-22)
+- Runtime cadence confirmed from code:
+  - `main_live.py` defaults `TIMEFRAME` to `1m` when env is unset, while YAML still documents a 15-minute bar setup.
+  - Timer loop is currently configured at 60 seconds.
+  - Order-book deltas and trade ticks are event-driven and continuous.
+- LLM input path confirmed:
+  - `on_timer()` builds `price_data`, `technical_data`, `microstructure`, `sentiment`, `current_position`, and `risk_context`, then calls `deepseek.analyze(...)`.
+  - Prompt payload audit log is compact; full prompt contains richer formatted sections and explicit heuristic weights.
+- Feature inventory confirmed:
+  - Technical: SMA/EMA, RSI, MACD, Bollinger, support/resistance, volume ratio, trend labels, recent K-lines.
+  - Microstructure: spread, microprice, TOB/depth imbalance, weighted depth imbalance, OFI/EMA OFI, queue pressure, trade-flow imbalance, sweeps, VWAP deviation, spread volatility, depth regime.
+  - Risk: wallet, exchange position, open orders, recent executions/closed P&L summary.
+- Important desk caveats:
+  - LLM weights are prompt instructions, not a calibrated statistical ensemble.
+  - Sentiment fetch currently defaults to `BTC` unless separately wired to active instrument.
+  - OB features are short-horizon/event-cadence; they are not yet bar-aligned 15-minute aggregates.
+
+## Plan (Capability Review - Multi-Coin / Multi-Timeframe / OB Reuse - 2026-05-22)
+- [x] Inspect live config and entrypoint for instrument/timeframe parameterization.
+- [x] Verify whether order-book subscriptions and features are active in the live strategy path.
+- [x] Determine whether the current architecture supports single-run reuse only or true concurrent multi-coin / multi-timeframe scanning.
+- [x] Record the conclusion and concrete next-step recommendation.
+
+## Review (Capability Review - Multi-Coin / Multi-Timeframe / OB Reuse - 2026-05-22)
+- Current live path already accepts a dynamic `INSTRUMENT_ID` and derives `bar_type` from `TIMEFRAME`, so the same strategy can be reused for different coin/timeframe pairs without changing core logic.
+- Order-book support is live, not stubbed: the strategy subscribes to order-book deltas and trade ticks, computes microstructure features through `OrderBookManager`, logs summaries, and injects the resulting feature set into the LLM prompt payload.
+- The present architecture is single-context per strategy instance: one `instrument_id`, one `bar_type`, one technical-indicator state, one order-book state, and one risk/execution context.
+- `TradingNodeConfig` is currently built with a single strategy config entry, so a thin utility class that just passes coin + timeframe is enough for sequential reuse, but not enough by itself for true concurrent market scanning/trading across many symbols/timeframes.
+- Important behavior nuance: the repo currently decouples bar timeframe from decision cadence. With 15-minute bars and a 60-second timer, the system can re-evaluate the same 15-minute bar while order-book features evolve intrabar.
+- Recommended next step if multi-asset analysis is the goal: extract a pure `MarketAnalysisContextBuilder` / `AnalysisRunner` layer that accepts `(instrument_id, timeframe)` and returns technical + microstructure + AI analysis without owning execution. Keep execution strategy instances separate from scanner instances.
+
 ## Plan (Autonomous Run - B1 Feature History Persistence - 2026-05-21)
 - [x] Run health gate and mandatory trader behavior audit from status + dashboard + fresh logs.
 - [x] Execute `BUILD_NEXT` for backlog item B1 and patch feature persistence to avoid CSV truncation.
@@ -281,3 +461,59 @@
     - Determinism hash: `c46c88fb5a839617d18ace784e6279335831ca8a23c25fac9c6365bfc7f9c5b0`.
   - `python3 tools/run_backtest.py --config configs/backtest_config.yaml` (repeat)
     - Result: identical determinism hash `c46c88fb5a839617d18ace784e6279335831ca8a23c25fac9c6365bfc7f9c5b0`.
+
+## Plan (IC-Driven Decision Layer Research - 2026-05-24)
+- [x] Inspect the current live decision path, prompt weighting, sentiment semantics, and position sizing logic.
+- [x] Read the attached IC article and extract the useful ideas around weak-signal combination, independence, and uncertainty-aware sizing.
+- [x] Synthesize concrete signal candidates, statistical evaluation methods, and an implementation order suitable for the current 1m + order-book runtime.
+
+## Review (IC-Driven Decision Layer Research - 2026-05-24)
+- Current architecture still mixes jobs that should be separated:
+  - `utils/deepseek_client.py` hard-codes static prompt weights for technical, microstructure, sentiment, and risk.
+  - `strategy/deepseek_strategy.py` still sizes off confidence/trend/RSI multipliers instead of a stop-distance risk budget.
+  - `utils/sentiment_client.py` remains BTC-oriented and the live strategy currently calls it without passing the active instrument symbol.
+- The attached article is directionally useful on three points:
+  - weak signals can compound if they are genuinely independent,
+  - correlation between signals matters more than raw feature count,
+  - sizing should shrink when edge uncertainty is unstable.
+- Most useful application to this repo:
+  - treat each technical, microstructure, sentiment, and higher-timeframe feature as a measurable weak signal,
+  - compute forward-return IC by horizon and regime,
+  - penalize correlated features and aggregate surviving signals into a pre-LLM decision-layer score,
+  - keep the LLM as a conditional explainer or tie-breaker, not the primary weight allocator.
+- Recommended build order:
+  - fix sentiment scope/confidence semantics,
+  - add regime labels and conditional IC logging,
+  - add a feature-research pipeline beyond the current microstructure-only CSV dump,
+  - build a small ensemble score from decorrelated weak signals,
+  - externalize stop-based sizing and uncertainty throttles.
+
+## Plan (Decision Audit Trail - CSV Journal + Reasoning Capture - 2026-05-27)
+- [x] Capture DeepSeek `reasoning_content` safely in analyzer output metadata.
+- [x] Add an append-only CSV trade journal writer with stable schema for downstream analysis.
+- [x] Wire strategy decision loop to persist one decision row per model call with market/context snapshots.
+- [x] Run compile verification and record implementation review notes.
+
+## Review (Decision Audit Trail - CSV Journal + Reasoning Capture - 2026-05-27)
+- Added new utility: `utils/trade_journal.py`
+  - `TradeJournalCSV` provides append-only CSV persistence with a fixed column schema.
+  - Handles header creation and JSON-serialization for nested snapshot fields.
+- Updated `utils/deepseek_client.py`:
+  - Captures `reasoning_content` from `response.choices[0].message.reasoning_content` when present.
+  - Adds `reasoning_content` and `llm_model` into the returned `signal_data`.
+  - Extends fallback payload to include empty `reasoning_content` + `llm_model`.
+- Updated `strategy/deepseek_strategy.py`:
+  - Added trade-journal init via env:
+    - `TRADE_JOURNAL_ENABLED` (default true)
+    - `TRADE_JOURNAL_CSV_PATH` (default `logs/trade_journal.csv`)
+  - Added bar timestamps (`bar_ts_event`, `bar_ts_init`) into `price_data`.
+  - Adds measured API latency (`llm_api_seconds`) onto each signal.
+  - `_execute_trade(...)` now returns structured execution summaries (`status/action/note/...`) for journaling.
+  - Added `_append_trade_journal_row(...)` to write one CSV row per LLM decision cycle with:
+    - signal/confidence/reason/reasoning
+    - market + technical + microstructure snapshots
+    - risk context summary
+    - position before/after snapshots
+    - execution intent summary
+- Verification:
+  - `python3 -m py_compile utils/deepseek_client.py utils/trade_journal.py strategy/deepseek_strategy.py` passed.

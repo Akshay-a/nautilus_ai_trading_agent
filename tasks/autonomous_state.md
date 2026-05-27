@@ -16,8 +16,8 @@ This file is owned by the hourly automation. Update it every run.
 - mode: `BUILD_NEXT`
 - last_run_utc: `2026-05-21T01:47:11Z`
 - last_health: `GREEN`
-- last_shipped_commit: `pending`
+- last_shipped_commit: `b6d1f37`
 - pending_live_verify: `yes`
-- pending_live_verify_target: `pending`
+- pending_live_verify_target: `b6d1f37`
 - active_backlog_item: `B1`
-- notes: `Built B1 by changing feature CSV dumps to append by unseen timestamp; live verify pending commit hash`
+- notes: `Built B1: feature CSV now appends unseen timestamps; next run must live-verify b6d1f37`
