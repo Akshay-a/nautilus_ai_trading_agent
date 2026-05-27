@@ -6,8 +6,10 @@ technical indicators for market analysis, and sentiment data for validation.
 """
 
 import os
+import re
 import asyncio
 import threading
+import time
 from decimal import Decimal
 from typing import Dict, Any, Optional, List, Tuple
 
@@ -19,7 +21,7 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.position import Position
 from nautilus_trader.model.orders import MarketOrder
-from datetime import timedelta
+from datetime import timedelta, datetime
 
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -28,6 +30,8 @@ from indicators.technical_manager import TechnicalIndicatorManager
 from indicators.orderbook_manager import OrderBookManager
 from utils.deepseek_client import DeepSeekAnalyzer
 from utils.sentiment_client import SentimentDataFetcher
+from utils.bybit_account_context import BybitAccountContextFetcher
+from utils.trade_journal import TradeJournalCSV
 # OCOManager no longer needed - using NautilusTrader's built-in bracket orders
 
 
@@ -84,9 +88,9 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     enable_auto_sl_tp: bool = True
     sl_use_support_resistance: bool = True
     sl_buffer_pct: float = 0.001
-    tp_high_confidence_pct: float = 0.03
-    tp_medium_confidence_pct: float = 0.02
-    tp_low_confidence_pct: float = 0.01
+    tp_high_confidence_pct: float = 0.008
+    tp_medium_confidence_pct: float = 0.005
+    tp_low_confidence_pct: float = 0.003
     
     # OCO (One-Cancels-the-Other)
     enable_oco: bool = True
@@ -98,15 +102,15 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     
     # Trailing Stop Loss
     enable_trailing_stop: bool = True
-    trailing_activation_pct: float = 0.01
-    trailing_distance_pct: float = 0.005
-    trailing_update_threshold_pct: float = 0.002
+    trailing_activation_pct: float = 0.003
+    trailing_distance_pct: float = 0.002
+    trailing_update_threshold_pct: float = 0.001
     
     # Partial Take Profit
     enable_partial_tp: bool = True
     partial_tp_levels: Tuple[Dict[str, float], ...] = (
-        {"profit_pct": 0.02, "position_pct": 0.5},
-        {"profit_pct": 0.04, "position_pct": 0.5},
+        {"profit_pct": 0.004, "position_pct": 0.5},
+        {"profit_pct": 0.008, "position_pct": 0.5},
     )
     
     # Telegram Notifications
@@ -211,16 +215,15 @@ class DeepSeekAIStrategy(Strategy):
         
         # Track trailing stop state for each position
         self.trailing_stop_state: Dict[str, Dict[str, Any]] = {}
-        # Format: {
-        #   "instrument_id": {
-        #       "entry_price": float,
-        #       "highest_price": float (for LONG) or "lowest_price": float (for SHORT),
-        #       "current_sl_price": float,
-        #       "sl_order_id": str,
-        #       "activated": bool,
-        #       "side": str (LONG/SHORT)
-        #   }
-        # }
+
+        # Position health tracking for scalp-aware LLM prompting
+        self._position_health: Dict[str, Any] = {
+            "peak_unrealized_pnl": 0.0,
+            "peak_profit_pct": 0.0,
+            "entry_bar_count": 0,
+            "entry_price": 0.0,
+            "entry_side": None,
+        }
 
         # Technical indicators manager
         sma_periods = config.sma_periods if config.sma_periods else [5, 20, 50]
@@ -383,10 +386,86 @@ class DeepSeekAIStrategy(Strategy):
         self.bars_received = 0
         self.dry_run = os.getenv("DRY_RUN", "false").strip().lower() == "true"
         self.llm_kline_context_bars = max(10, int(config.llm_kline_context_bars))
+        self.base_asset = self._derive_base_asset()
+        self.exchange_context_fetcher = BybitAccountContextFetcher.from_env(
+            instrument_id=str(self.instrument_id),
+            logger=self.log,
+        )
+        self.exchange_risk_context: Optional[Dict[str, Any]] = None
+        self.exchange_context_interval_sec = int(os.getenv("EXCHANGE_CONTEXT_INTERVAL_SEC", "60"))
+        self._last_exchange_context_refresh_monotonic = 0.0
+        self.trade_journal_enabled = os.getenv("TRADE_JOURNAL_ENABLED", "true").strip().lower() == "true"
+        self.trade_journal_path = os.getenv("TRADE_JOURNAL_CSV_PATH", "logs/trade_journal.csv")
+        self.trade_journal: Optional[TradeJournalCSV] = None
+        if self.trade_journal_enabled:
+            try:
+                self.trade_journal = TradeJournalCSV(self.trade_journal_path)
+                self.log.info(f"Decision trade journal enabled: {self.trade_journal_path}")
+            except Exception as e:
+                self.trade_journal_enabled = False
+                self.log.warning(f"Failed to initialize trade journal: {e}")
 
         self.log.info(f"DeepSeek AI Strategy initialized for {self.instrument_id}")
         if self.dry_run:
             self.log.warning("⚠️ DRY_RUN=true: Orders will be simulated and NOT submitted to exchange")
+        if self.exchange_context_fetcher:
+            self.log.info("Bybit read-only risk context enabled")
+
+    def _derive_base_asset(self) -> str:
+        """Derive the base asset symbol from the configured instrument id."""
+        symbol = str(self.instrument_id).split("-")[0].split(".")[0]
+        for quote in ("USDT", "USDC", "USD", "BTC", "ETH"):
+            if symbol.endswith(quote) and len(symbol) > len(quote):
+                return symbol[:-len(quote)]
+        return symbol
+
+    def _log_info_safe(self, message: str) -> None:
+        """Log info when Nautilus has registered the strategy logger."""
+        try:
+            self.log.info(message)
+        except Exception:
+            return
+
+    def _log_warning_safe(self, message: str) -> None:
+        """Log warning when Nautilus has registered the strategy logger."""
+        try:
+            self.log.warning(message)
+        except Exception:
+            return
+
+    def _refresh_exchange_risk_context(self, force: bool = False) -> Optional[Dict[str, Any]]:
+        """Refresh read-only exchange context with simple time throttling."""
+        if self.exchange_context_fetcher is None:
+            return self.exchange_risk_context
+
+        now = time.monotonic()
+        if (
+            not force
+            and self.exchange_risk_context is not None
+            and (now - self._last_exchange_context_refresh_monotonic) < self.exchange_context_interval_sec
+        ):
+            return self.exchange_risk_context
+
+        try:
+            context = self.exchange_context_fetcher.fetch()
+        except Exception as e:
+            self.log.warning(f"⚠️ Failed to refresh Bybit risk context: {e}")
+            return self.exchange_risk_context
+
+        self.exchange_risk_context = context
+        self._last_exchange_context_refresh_monotonic = now
+        position = context.get("position") or {}
+        wallet = context.get("wallet") or {}
+        self.log.info(
+            "💼 Bybit Risk Context: "
+            f"available={wallet.get('total_available_balance')} "
+            f"equity={wallet.get('total_equity')} "
+            f"position={position.get('side', 'flat')} "
+            f"{position.get('quantity', 0)} {self.base_asset} "
+            f"open_orders={len(context.get('open_orders') or [])} "
+            f"last5_pnl={(context.get('recent_trade_summary') or {}).get('last_5_realized_pnl')}"
+        )
+        return context
 
     def on_start(self):
         """Actions to be performed on strategy start."""
@@ -400,6 +479,7 @@ class DeepSeekAIStrategy(Strategy):
             return
 
         self.log.info(f"Loaded instrument: {self.instrument.id}")
+        self._refresh_exchange_risk_context(force=True)
 
         # Pre-fetch historical bars before subscribing to live data.
         # Warmup size is configurable so operators can trade off startup time vs context depth.
@@ -613,26 +693,50 @@ class DeepSeekAIStrategy(Strategy):
         """Return whether strategy should simulate execution only."""
         return self.dry_run
 
+    def _derive_bar_period_seconds(self) -> int:
+        """Bar duration implied by configured bar_type (used for OB window anchoring)."""
+        text = str(self.bar_type).upper()
+        m = re.search(r"-([0-9]+)-(MINUTE|HOUR|DAY)-", text)
+        if not m:
+            return 60
+        qty = int(m.group(1))
+        unit = m.group(2)
+        if unit == "MINUTE":
+            return max(60, qty * 60)
+        if unit == "HOUR":
+            return max(60, qty * 3600)
+        if unit == "DAY":
+            return max(60, qty * 86400)
+        return 60
+
+    @staticmethod
+    def _nanos_to_utc_iso(nanos: int) -> str:
+        """RFC3339-style UTC ISO timestamp from unix epoch nanoseconds."""
+        try:
+            sec = float(nanos) / 1e9
+            return datetime.utcfromtimestamp(sec).isoformat() + "Z"
+        except (TypeError, ValueError, OSError):
+            return ""
+
     def on_bar(self, bar: Bar):
         """
-        Handle bar updates.
-
-        Parameters
-        ----------
-        bar : Bar
-            The bar received
+        Primary decision loop: run after each completed bar for the configured bar_type.
         """
+        if bar.bar_type != self.bar_type:
+            return
+
         self.bars_received += 1
 
         # Update technical indicators
         self.indicator_manager.update(bar)
 
-        # Log bar data
         if self.bars_received % 10 == 0:
             self.log.info(
                 f"Bar #{self.bars_received}: "
                 f"O:{bar.open} H:{bar.high} L:{bar.low} C:{bar.close} V:{bar.volume}"
             )
+
+        self._run_bar_close_decision_cycle(completed_bar=bar)
 
     def on_order_book_deltas(self, deltas) -> None:
         """
@@ -697,28 +801,49 @@ class DeepSeekAIStrategy(Strategy):
         self.orderbook_manager.update_trade(tick)
 
     def on_timer(self, event):
-        """
-        Periodic analysis and trading logic.
+        """Timer-only housekeeping: risk refresh, bracket maintenance, optional OB CSV dumps."""
+        self.log.info("⏲️ Ops timer: maintenance (no standalone LLM call).")
 
-        Called every timer_interval_sec seconds (default: 15 minutes).
-        """
-        self.log.info("=" * 60)
-        self.log.info("Running periodic analysis...")
+        try:
+            self._refresh_exchange_risk_context()
+        except Exception:
+            pass
 
-        # Check if indicators are ready
+        last_px: Optional[float] = None
+        bars = getattr(self.indicator_manager, "recent_bars", []) or []
+        if bars:
+            last_px = float(bars[-1].close)
+
+        if last_px is not None:
+            if self.enable_trailing_stop:
+                self._update_trailing_stops(last_px)
+
+        if self.enable_oco and self.oco_manager:
+            self._cleanup_oco_orphans()
+
+        if self.orderbook_manager and self.orderbook_manager.is_ready():
+            try:
+                dump_path = self.orderbook_manager.dump_features_csv(
+                    path="data/microstructure_features.csv",
+                    fwd_bars=(1, 5),
+                )
+                if dump_path:
+                    self.log.debug(f"📁 Ops timer OB feature dump appended: {dump_path}")
+            except Exception as e:
+                self.log.warning(f"Feature dump failed: {e}")
+
+    def _run_bar_close_decision_cycle(self, completed_bar: Bar) -> None:
+        """
+        Candle-close LLM synthesis + journaling + discretionary execution hooks.
+        Must only run AFTER indicators update for `completed_bar`.
+        """
         if not self.indicator_manager.is_initialized():
-            self.log.warning("Indicators not yet initialized, skipping analysis")
+            self.log.warning("Indicators not yet initialized, skipping candle-close synthesis")
             return
 
-        # Get current market data
-        current_bar = self.indicator_manager.recent_bars[-1] if self.indicator_manager.recent_bars else None
-        if not current_bar:
-            self.log.warning("No bars available for analysis")
-            return
-
+        current_bar = completed_bar
         current_price = float(current_bar.close)
 
-        # Get technical data
         try:
             technical_data = self.indicator_manager.get_technical_data(current_price)
             self.log.debug(f"Technical data retrieved: {len(technical_data)} indicators")
@@ -726,11 +851,9 @@ class DeepSeekAIStrategy(Strategy):
             self.log.error(f"Failed to get technical data: {e}")
             return
 
-        # Get K-line data for LLM context (configurable depth)
         kline_data = self.indicator_manager.get_kline_data(count=self.llm_kline_context_bars)
         self.log.debug(f"Retrieved {len(kline_data)} K-lines for analysis")
 
-        # Get sentiment data
         sentiment_data = None
         if self.sentiment_enabled and self.sentiment_fetcher:
             try:
@@ -740,15 +863,20 @@ class DeepSeekAIStrategy(Strategy):
             except Exception as e:
                 self.log.warning(f"Failed to fetch sentiment data: {e}")
 
-        # Get microstructure data (if order book is active)
         microstructure_data = None
         if self.orderbook_manager and self.orderbook_manager.is_ready():
-            microstructure_data = self.orderbook_manager.get_summary()
+            summary = dict(self.orderbook_manager.get_summary())
+            tf_secs = self._derive_bar_period_seconds()
+            summary["tf_windows"] = self.orderbook_manager.get_tf_window_summaries(
+                tf_secs, now_ns=int(current_bar.ts_event)
+            )
+            microstructure_data = summary
 
-        # Build price data for AI
         price_data = {
             'price': current_price,
             'timestamp': self.clock.utc_now().isoformat(),
+            'bar_ts_event': int(current_bar.ts_event),
+            'bar_ts_init': int(current_bar.ts_init),
             'high': float(current_bar.high),
             'low': float(current_bar.low),
             'volume': float(current_bar.volume),
@@ -757,68 +885,120 @@ class DeepSeekAIStrategy(Strategy):
             'instrument_id': str(self.instrument_id),
             'bar_type': str(self.bar_type),
         }
-        if microstructure_data:
-            price_data['microstructure'] = microstructure_data
+        price_data["bar_close_ts_utc"] = self._nanos_to_utc_iso(int(current_bar.ts_event))
 
-        # Get current position
+        if microstructure_data:
+            price_data["microstructure"] = microstructure_data
+
+        risk_context = self._refresh_exchange_risk_context()
+
         current_position = self._get_current_position_data()
+        current_position = self._merge_exchange_position_context(current_position, risk_context)
+        current_position = self._enrich_position_health(current_position)
 
-        # Log current state
-        self.log.info(f"Current Price: ${current_price:,.2f}")
-        self.log.info(f"Overall Trend: {technical_data.get('overall_trend', 'N/A')}")
-        self.log.info(f"RSI: {technical_data.get('rsi', 0):.2f}")
-        if microstructure_data:
-            ms = microstructure_data
-            self.log.info(
-                f"📊 Microstructure: "
-                f"spr={ms.get('spread_bps', 0):.1f}bps "
-                f"spr_vol={ms.get('spread_volatility', 0):.3f} "
-                f"μpx={ms.get('microprice', 0):.2f} "
-                f"tob={ms.get('tob_imbalance', 0):+.3f} "
-                f"depth={ms.get('depth_imbalance', 0):+.3f} "
-                f"ofi={ms.get('ema_ofi', 0):+.4f} "
-                f"qp={ms.get('queue_pressure', 0):+.3f} "
-                f"tf={ms.get('trade_flow_imbalance', 0):+.3f} "
-                f"vwap_dev={ms.get('vwap_deviation_bps', 0):+.1f}bps "
-                f"sw={ms.get('sweep_buy_count', 0)}B/{ms.get('sweep_sell_count', 0)}S "
-                f"regime={ms.get('depth_regime', '?')}"
-            )
-            # Periodic feature dump to CSV for offline IC analysis
-            try:
-                dump_path = self.orderbook_manager.dump_features_csv(
-                    path="data/microstructure_features.csv",
-                    fwd_bars=(1, 5),
-                )
-                if dump_path:
-                    self.log.info(f"📁 Feature dump: {dump_path} ({self.orderbook_manager.depth_updates_received} rows)")
-            except Exception as e:
-                self.log.warning(f"Feature dump failed: {e}")
+        # Compact bar-close summary (single line instead of 3-4 verbose lines)
+        ms = microstructure_data or {}
+        self.log.info(
+            f"📌 Bar-close @ {price_data['bar_close_ts_utc'] or '?'} "
+            f"px=${current_price:,.2f} "
+            f"trend={technical_data.get('overall_trend', '?')} "
+            f"rsi={technical_data.get('rsi', 0):.1f} "
+            f"rvol={technical_data.get('rvol', 0):.2f} "
+            f"ob_tfi={ms.get('trade_flow_imbalance', 0):+.2f} "
+            f"regime={ms.get('depth_regime', '?')}"
+        )
+
         if current_position:
+            health = current_position.get("position_health") or {}
             self.log.info(
                 f"Current Position: {current_position['side']} "
-                f"{current_position['quantity']} @ ${current_position['avg_px']:.2f}"
+                f"{current_position['quantity']} {self.base_asset} @ ${current_position['avg_px']:.2f} "
+                f"uPnL={current_position.get('unrealized_pnl', 0):.2f} "
+                f"peak={health.get('peak_unrealized_pnl', 0):.2f} "
+                f"giveback={health.get('giveback_pct', 0):.0f}% "
+                f"bars_held={health.get('bars_held', 0)} "
+                f"health={health.get('recommendation', '?')} "
+                f"(source={current_position.get('source', 'nautilus')})"
             )
 
-        # Analyze with DeepSeek AI
+        # --- Give-back protection circuit breaker ---
+        # If a profitable position has given back >60% of peak profit,
+        # auto-exit without consulting the LLM (saves latency + prevents further loss).
+        if current_position:
+            health = current_position.get("position_health") or {}
+            giveback = health.get("giveback_pct", 0)
+            peak_pnl = health.get("peak_unrealized_pnl", 0)
+            if peak_pnl > 5.0 and giveback > 60:
+                self.log.warning(
+                    f"🛡️ GIVE-BACK PROTECTION: peak uPnL was ${peak_pnl:.2f}, "
+                    f"now given back {giveback:.0f}%. Auto-closing position."
+                )
+                close_side = (
+                    OrderSide.SELL if current_position["side"] == "long" else OrderSide.BUY
+                )
+                qty = current_position["quantity"]
+                self._submit_order(side=close_side, quantity=qty, reduce_only=True)
+
+                gb_exec = {
+                    "status": "submitted",
+                    "action": "giveback_protection_exit",
+                    "target_side": "flat",
+                    "target_quantity": qty,
+                    "note": f"auto_exit_giveback_{giveback:.0f}pct_peak_{peak_pnl:.2f}",
+                }
+                fb = self.deepseek._emit_fallback(price_data)
+                fb["signal"] = "SELL" if current_position["side"] == "long" else "BUY"
+                fb["confidence"] = "HIGH"
+                fb["thesis"] = f"Give-back protection: peak uPnL ${peak_pnl:.2f}, gave back {giveback:.0f}%"
+                fb["reasoning_content"] = "circuit_breaker:giveback_protection"
+                self.last_signal = fb
+
+                position_after = self._get_current_position_data()
+                self._append_trade_journal_row(
+                    signal_data=fb,
+                    price_data=price_data,
+                    technical_data=technical_data,
+                    microstructure_data=microstructure_data,
+                    risk_context=risk_context,
+                    current_position=current_position,
+                    position_after=position_after,
+                    execution_summary=gb_exec,
+                    bar_close_iso=price_data.get("bar_close_ts_utc"),
+                    execution_ts_iso=datetime.utcnow().isoformat(),
+                    decision_ts_iso=datetime.utcnow().isoformat(),
+                    latency_ms=0,
+                    decision_trigger="giveback_protection",
+                )
+                return
+
+        execution_summary = {"status": "error", "action": "none", "note": "pre_llm"}
+
+        signal_data = None
+
         try:
             import time as _time
-            self.log.info("Calling DeepSeek AI for analysis...")
+
+            self.log.info("Calling DeepSeek AI (bar-aligned synthesis)...")
             _t0 = _time.monotonic()
             signal_data = self.deepseek.analyze(
                 price_data=price_data,
                 technical_data=technical_data,
                 sentiment_data=sentiment_data,
                 current_position=current_position,
+                risk_context=risk_context,
             )
             _elapsed = _time.monotonic() - _t0
             self.log.info(
                 f"🤖 Signal: {signal_data['signal']} | "
                 f"Confidence: {signal_data['confidence']} | "
                 f"API time: {_elapsed:.1f}s | "
-                f"Reason: {signal_data['reason']}"
+                f"Reason: {signal_data.get('reason', '')}"
             )
-            
-            # Send Telegram signal notification (only for actionable signals)
+            signal_data["llm_api_seconds"] = round(_elapsed, 6)
+            latency_ms_val = int(round(_elapsed * 1000))
+            signal_data["_latency_ms"] = latency_ms_val
+            decision_ts_completed = datetime.utcnow().isoformat()
+
             if self.telegram_bot and self.enable_telegram and self.telegram_notify_signals:
                 if signal_data['signal'] in ['BUY', 'SELL']:
                     try:
@@ -831,41 +1011,96 @@ class DeepSeekAIStrategy(Strategy):
                             'macd': technical_data.get('macd', 0),
                             'support': technical_data.get('support', 0),
                             'resistance': technical_data.get('resistance', 0),
-                            'reasoning': signal_data['reason'],
+                            'reasoning': signal_data.get('reason', ''),
                         })
                         self.telegram_bot.send_message_sync(signal_notification)
                     except Exception as e:
                         self.log.warning(f"Failed to send Telegram signal notification: {e}")
-                        
+
+            self.last_signal = signal_data
+
+            execution_summary = self._execute_trade(
+                signal_data, price_data, technical_data, current_position, risk_context
+            )
+            execution_ts_wall = datetime.utcnow()
+            signal_data["_execution_completed"] = execution_ts_wall.isoformat()
+
+            position_after = self._get_current_position_data()
+            tw = (microstructure_data or {}).get('tf_windows') or {}
+
+            ob_fast = ""
+            ob_main = ""
+            ob_ctx = ""
+            if isinstance(tw, dict) and tw.get("ready"):
+                ob_fast = tw.get("fast")
+                ob_main = tw.get("main")
+                ob_ctx = tw.get("context")
+
+            self._append_trade_journal_row(
+                signal_data=signal_data,
+                price_data=price_data,
+                technical_data=technical_data,
+                microstructure_data=microstructure_data,
+                risk_context=risk_context,
+                current_position=current_position,
+                position_after=position_after,
+                execution_summary=execution_summary,
+                bar_close_iso=price_data.get("bar_close_ts_utc"),
+                execution_ts_iso=execution_ts_wall.isoformat(),
+                decision_ts_iso=decision_ts_completed,
+                latency_ms=latency_ms_val,
+                decision_trigger="on_bar",
+                ob_window_fast_json=ob_fast,
+                ob_window_main_json=ob_main,
+                ob_window_context_json=ob_ctx,
+            )
+
         except Exception as e:
             self.log.error(f"DeepSeek AI analysis failed: {e}", exc_info=True)
-            
-            # Send error notification
             if self.telegram_bot and self.enable_telegram and self.telegram_notify_errors:
                 try:
                     error_msg = self.telegram_bot.format_error_alert({
                         'level': 'ERROR',
                         'message': f"AI Analysis Failed: {str(e)[:100]}",
-                        'context': 'on_timer'
+                        'context': 'on_bar_cycle',
                     })
                     self.telegram_bot.send_message_sync(error_msg)
-                except:
+                except Exception:
                     pass
-            return
 
-        # Store signal
-        self.last_signal = signal_data
+            fb = self.deepseek._emit_fallback(price_data)
+            fb["reasoning_content"] = (fb.get("reasoning_content") or "") + (
+                "\nexception:" + repr(e)[:500]
+            )
+            fb["_latency_ms"] = None
+            self.last_signal = fb
+            pos_after_fail = self._get_current_position_data()
+            tw = (microstructure_data or {}).get('tf_windows') or {}
+            ob_fast_f = ""
+            ob_main_f = ""
+            ob_ctx_f = ""
+            if isinstance(tw, dict) and tw.get("ready"):
+                ob_fast_f, ob_main_f, ob_ctx_f = tw.get("fast"), tw.get("main"), tw.get("context")
 
-        # Execute trade
-        self._execute_trade(signal_data, price_data, technical_data, current_position)
-        
-        # OCO maintenance: cleanup orphan orders and expired groups
-        if self.enable_oco and self.oco_manager:
-            self._cleanup_oco_orphans()
-        
-        # Trailing stop maintenance: check and update trailing stops
-        if self.enable_trailing_stop:
-            self._update_trailing_stops(price_data['price'])
+            fail_exec = {"status": "error", "action": "none", "note": f"analyze_exception:{type(e).__name__}"}
+            self._append_trade_journal_row(
+                signal_data=fb,
+                price_data=price_data,
+                technical_data=technical_data,
+                microstructure_data=microstructure_data,
+                risk_context=risk_context,
+                current_position=current_position,
+                position_after=pos_after_fail,
+                execution_summary=fail_exec,
+                bar_close_iso=price_data.get("bar_close_ts_utc"),
+                execution_ts_iso=datetime.utcnow().isoformat(),
+                decision_ts_iso=datetime.utcnow().isoformat(),
+                latency_ms=None,
+                decision_trigger="on_bar",
+                ob_window_fast_json=ob_fast_f,
+                ob_window_main_json=ob_main_f,
+                ob_window_context_json=ob_ctx_f,
+            )
 
     def _calculate_price_change(self) -> float:
         """Calculate price change percentage."""
@@ -878,39 +1113,369 @@ class DeepSeekAIStrategy(Strategy):
 
         return ((current - previous) / previous) * 100
 
+    def _append_trade_journal_row(
+        self,
+        signal_data: Dict[str, Any],
+        price_data: Dict[str, Any],
+        technical_data: Dict[str, Any],
+        microstructure_data: Optional[Dict[str, Any]],
+        risk_context: Optional[Dict[str, Any]],
+        current_position: Optional[Dict[str, Any]],
+        position_after: Optional[Dict[str, Any]],
+        execution_summary: Dict[str, Any],
+        *,
+        bar_close_iso: Optional[str] = None,
+        execution_ts_iso: Optional[str] = None,
+        decision_ts_iso: Optional[str] = None,
+        latency_ms: Optional[float] = None,
+        decision_trigger: str = "on_bar",
+        ob_window_fast_json: Any = None,
+        ob_window_main_json: Any = None,
+        ob_window_context_json: Any = None,
+    ) -> None:
+        """Append one decision row to the CSV trade journal."""
+        if not self.trade_journal_enabled or self.trade_journal is None:
+            return
+
+        wallet = (risk_context or {}).get("wallet") or {}
+        trade_summary = (risk_context or {}).get("recent_trade_summary") or {}
+        micro = microstructure_data or {}
+        position_before = current_position or {}
+        execution = execution_summary or {}
+
+        tw = micro.get("tf_windows") or {}
+        if ob_window_fast_json is None and isinstance(tw, dict) and tw.get("ready"):
+            ob_window_fast_json = tw.get("fast")
+        if ob_window_main_json is None and isinstance(tw, dict) and tw.get("ready"):
+            ob_window_main_json = tw.get("main")
+        if ob_window_context_json is None and isinstance(tw, dict) and tw.get("ready"):
+            ob_window_context_json = tw.get("context")
+
+        bc = bar_close_iso or price_data.get("bar_close_ts_utc") or ""
+        dec_ts = decision_ts_iso or datetime.utcnow().isoformat()
+        exe_ts = execution_ts_iso or ""
+        lat = latency_ms
+        if lat is None and signal_data.get("_latency_ms") is not None:
+            lat = signal_data.get("_latency_ms")
+
+        reasoning_cell = signal_data.get("reasoning_content")
+        if reasoning_cell is None:
+            reasoning_cell = ""
+        sig_json = {
+            k: v for k, v in signal_data.items()
+            if not str(k).startswith("_")
+        }
+
+        try:
+            latency_cell = "" if lat is None else int(round(float(lat)))
+        except (TypeError, ValueError):
+            latency_cell = ""
+
+        row = {
+            "decision_ts_utc": dec_ts,
+            "decision_ts": dec_ts,
+            "strategy_ts": price_data.get("timestamp"),
+            "instrument_id": str(self.instrument_id),
+            "bar_type": str(self.bar_type),
+            "bar_ts_event": price_data.get("bar_ts_event"),
+            "bar_ts_init": price_data.get("bar_ts_init"),
+            "signal": signal_data.get("signal"),
+            "confidence": signal_data.get("confidence"),
+            "trend_strength": signal_data.get("trend_strength"),
+            "risk_assessment": signal_data.get("risk_assessment"),
+            "is_fallback": signal_data.get("is_fallback", False),
+            "reason": signal_data.get("reason"),
+            "reasoning_content": reasoning_cell,
+            "llm_model": signal_data.get("llm_model"),
+            "llm_api_seconds": signal_data.get("llm_api_seconds"),
+            "current_price": price_data.get("price"),
+            "period_high": price_data.get("high"),
+            "period_low": price_data.get("low"),
+            "bar_volume": price_data.get("volume"),
+            "price_change_pct": price_data.get("price_change"),
+            "overall_trend": technical_data.get("overall_trend"),
+            "short_term_trend": technical_data.get("short_term_trend"),
+            "medium_term_trend": technical_data.get("medium_term_trend"),
+            "rsi": technical_data.get("rsi"),
+            "macd": technical_data.get("macd"),
+            "macd_signal": technical_data.get("macd_signal"),
+            "macd_histogram": technical_data.get("macd_histogram"),
+            "volume_ratio": technical_data.get("volume_ratio"),
+            "support": technical_data.get("support"),
+            "resistance": technical_data.get("resistance"),
+            "ob_spread_bps": micro.get("spread_bps"),
+            "ob_spread_volatility": micro.get("spread_volatility"),
+            "ob_tob_imbalance": micro.get("tob_imbalance"),
+            "ob_depth_imbalance": micro.get("depth_imbalance"),
+            "ob_ema_ofi": micro.get("ema_ofi"),
+            "ob_queue_pressure": micro.get("queue_pressure"),
+            "ob_trade_flow_imbalance": micro.get("trade_flow_imbalance"),
+            "ob_vwap_deviation_bps": micro.get("vwap_deviation_bps"),
+            "ob_sweep_buy_count": micro.get("sweep_buy_count"),
+            "ob_sweep_sell_count": micro.get("sweep_sell_count"),
+            "ob_depth_regime": micro.get("depth_regime"),
+            "position_before_side": position_before.get("side"),
+            "position_before_qty": position_before.get("quantity"),
+            "position_before_avg_px": position_before.get("avg_px"),
+            "position_before_upnl": position_before.get("unrealized_pnl"),
+            "position_before_source": position_before.get("source"),
+            "risk_total_equity": wallet.get("total_equity"),
+            "risk_total_available_balance": wallet.get("total_available_balance"),
+            "risk_open_orders_count": len((risk_context or {}).get("open_orders") or []),
+            "risk_recent_realized_pnl_5": trade_summary.get("last_5_realized_pnl"),
+            "execution_status": execution.get("status"),
+            "execution_action": execution.get("action"),
+            "execution_target_side": execution.get("target_side"),
+            "execution_target_quantity": execution.get("target_quantity"),
+            "execution_note": execution.get("note"),
+            "technical_snapshot_json": technical_data,
+            "microstructure_snapshot_json": micro,
+            "risk_context_json": risk_context,
+            "position_before_json": current_position,
+            "position_after_json": position_after,
+            "bar_close_ts_utc": bc,
+            "bar_close_ts": bc,
+            "execution_ts_utc": exe_ts,
+            "execution_ts": exe_ts,
+            "latency_ms": latency_cell,
+            "decision_cycle_trigger": decision_trigger,
+            "llm_market_regime": signal_data.get("regime"),
+            "thesis": signal_data.get("thesis"),
+            "invalidation": signal_data.get("invalidation"),
+            "llm_execution_note": signal_data.get("execution_note"),
+            "volume_note": signal_data.get("volume_note"),
+            "rvol": technical_data.get("rvol"),
+            "volume_zscore": technical_data.get("volume_zscore"),
+            "volume_trend_slope": technical_data.get("volume_trend_slope"),
+            "directional_volume_confirmation": technical_data.get(
+                "directional_volume_confirmation"
+            ),
+            "technical_volume_regime": technical_data.get("volume_regime"),
+            "ob_window_fast_json": ob_window_fast_json,
+            "ob_window_main_json": ob_window_main_json,
+            "ob_window_context_json": ob_window_context_json,
+            "signal_json": sig_json,
+        }
+
+        try:
+            self.trade_journal.append(row)
+        except Exception as e:
+            self._log_warning_safe(f"Trade journal append failed: {e}")
+
     def _get_current_position_data(self) -> Optional[Dict[str, Any]]:
-        """Get current position information."""
+        """Get aggregate current position information for the active instrument."""
         # Get open positions for this instrument
         positions = self.cache.positions_open(instrument_id=self.instrument_id)
         
         if not positions:
             return None
         
-        # Get the first open position (should only be one for netting OMS)
-        position = positions[0]
-        
-        if position and position.is_open:
-            # Get current price for PnL calculation
-            # Use last bar close price as it's more reliable than cache.price()
-            # cache.price() requires tick data which may not be available
-            bars = self.indicator_manager.recent_bars
-            if bars:
-                current_price = bars[-1].close
-            else:
-                # Fallback: try cache.price() if bars not available
-                try:
-                    current_price = self.cache.price(self.instrument_id, PriceType.LAST)
-                except (TypeError, AttributeError):
-                    current_price = None
-            
-            return {
-                'side': 'long' if position.side == PositionSide.LONG else 'short',
-                'quantity': float(position.quantity),
-                'avg_px': float(position.avg_px_open),
-                'unrealized_pnl': float(position.unrealized_pnl(current_price)) if current_price else 0.0,
+        # Use last bar close price as it's more reliable than cache.price().
+        # cache.price() requires tick data which may not be available.
+        bars = self.indicator_manager.recent_bars
+        if bars:
+            current_price = bars[-1].close
+        else:
+            try:
+                current_price = self.cache.price(self.instrument_id, PriceType.LAST)
+            except (TypeError, AttributeError):
+                current_price = None
+
+        signed_qty = 0.0
+        gross_qty = 0.0
+        weighted_avg_notional = 0.0
+        unrealized_pnl = 0.0
+        position_ids: List[str] = []
+
+        for position in positions:
+            if not position or not position.is_open:
+                continue
+
+            qty = float(position.quantity)
+            if qty <= 0:
+                continue
+
+            side_mult = 1.0 if position.side == PositionSide.LONG else -1.0
+            signed_qty += side_mult * qty
+            gross_qty += qty
+            weighted_avg_notional += qty * float(position.avg_px_open)
+            position_ids.append(str(position.id))
+
+            if current_price:
+                unrealized_pnl += float(position.unrealized_pnl(current_price))
+
+        if abs(signed_qty) <= 0:
+            return None
+
+        quantity = abs(signed_qty)
+        avg_px = (weighted_avg_notional / gross_qty) if gross_qty > 0 else 0.0
+        current_price_float = float(current_price) if current_price else avg_px
+
+        return {
+            'side': 'long' if signed_qty > 0 else 'short',
+            'quantity': quantity,
+            'signed_quantity': signed_qty,
+            'avg_px': avg_px,
+            'unrealized_pnl': unrealized_pnl,
+            'notional_usdt': quantity * current_price_float,
+            'position_count': len(position_ids),
+            'position_ids': position_ids,
+            'source': 'nautilus_aggregate',
+        }
+
+    def _enrich_position_health(self, position_data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """
+        Add position health metrics for scalp-aware LLM prompting.
+
+        Tracks peak unrealized P&L, giveback percentage, and bars held so the LLM
+        can make informed profit-taking decisions.
+        """
+        if position_data is None:
+            self._position_health = {
+                "peak_unrealized_pnl": 0.0,
+                "peak_profit_pct": 0.0,
+                "entry_bar_count": 0,
+                "entry_price": 0.0,
+                "entry_side": None,
+            }
+            return None
+
+        upnl = float(position_data.get("unrealized_pnl", 0.0))
+        notional = float(position_data.get("notional_usdt", 0.0))
+        current_side = position_data.get("side")
+
+        if self._position_health.get("entry_side") != current_side:
+            self._position_health = {
+                "peak_unrealized_pnl": upnl,
+                "peak_profit_pct": 0.0,
+                "entry_bar_count": self.bars_received,
+                "entry_price": float(position_data.get("avg_px", 0.0)),
+                "entry_side": current_side,
             }
 
-        return None
+        if upnl > self._position_health["peak_unrealized_pnl"]:
+            self._position_health["peak_unrealized_pnl"] = upnl
+
+        peak = self._position_health["peak_unrealized_pnl"]
+        profit_pct = (upnl / notional * 100) if notional > 0 else 0.0
+        peak_profit_pct = (peak / notional * 100) if notional > 0 else 0.0
+        if peak_profit_pct > self._position_health["peak_profit_pct"]:
+            self._position_health["peak_profit_pct"] = peak_profit_pct
+
+        giveback_pct = 0.0
+        if peak > 0 and upnl < peak:
+            giveback_pct = ((peak - upnl) / peak) * 100
+
+        bars_held = max(0, self.bars_received - self._position_health["entry_bar_count"])
+
+        recommendation = "hold"
+        if giveback_pct > 60:
+            recommendation = "exit_now"
+        elif giveback_pct > 40:
+            recommendation = "consider_exit"
+        elif profit_pct > 0.3:
+            recommendation = "consider_taking_profit"
+        elif profit_pct < -0.5:
+            recommendation = "consider_cutting_loss"
+
+        position_data["position_health"] = {
+            "profit_pct": round(profit_pct, 4),
+            "peak_profit_pct": round(self._position_health["peak_profit_pct"], 4),
+            "giveback_pct": round(giveback_pct, 1),
+            "bars_held": bars_held,
+            "peak_unrealized_pnl": round(peak, 2),
+            "recommendation": recommendation,
+        }
+        return position_data
+
+    def _position_adjustment_threshold(self) -> float:
+        """Return the minimum meaningful position delta for this instrument."""
+        configured = float(self.position_config.get('adjustment_threshold', 0.0))
+        increment = None
+        if self.instrument is not None:
+            for attr_name in ("size_increment", "min_quantity", "min_size"):
+                value = getattr(self.instrument, attr_name, None)
+                if value is not None:
+                    try:
+                        increment = float(value)
+                        break
+                    except (TypeError, ValueError):
+                        continue
+        return max(configured, increment or 0.0, float(self.position_config['min_trade_amount']))
+
+    def _position_from_exchange_context(self, risk_context: Dict[str, Any], source: str) -> Optional[Dict[str, Any]]:
+        """Convert Bybit position context into the strategy position shape."""
+        exchange_position = (risk_context or {}).get("position") or {}
+        quantity = float(exchange_position.get("quantity") or 0.0)
+        if quantity <= 0:
+            return None
+        side = str(exchange_position.get("side") or "").lower()
+        signed_quantity = -quantity if side == "short" else quantity
+        mark_price = float(exchange_position.get("mark_price") or 0.0)
+        return {
+            "side": side,
+            "quantity": quantity,
+            "signed_quantity": signed_quantity,
+            "avg_px": float(exchange_position.get("avg_price") or 0.0),
+            "unrealized_pnl": float(exchange_position.get("unrealized_pnl") or 0.0),
+            "notional_usdt": float(exchange_position.get("position_value") or (quantity * mark_price)),
+            "position_count": 1,
+            "position_ids": [],
+            "source": source,
+        }
+
+    def _merge_exchange_position_context(
+        self,
+        current_position: Optional[Dict[str, Any]],
+        risk_context: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Prefer exchange position truth when Nautilus is missing or materially stale.
+
+        Nautilus remains the execution substrate, but the decision loop should not
+        open duplicate exposure just because the local cache missed an external
+        or pre-existing position.
+        """
+        if not risk_context:
+            return current_position
+
+        exchange_position = risk_context.get("position")
+        if not exchange_position:
+            return current_position
+
+        exchange_as_position = self._position_from_exchange_context(
+            risk_context,
+            source="bybit_exchange_fallback",
+        )
+        if exchange_as_position is None:
+            return current_position
+
+        if current_position is None:
+            self.log.warning(
+                "⚠️ Nautilus cache has no open position but Bybit reports "
+                f"{exchange_as_position['side']} {exchange_as_position['quantity']} {self.base_asset}; "
+                "using exchange position context for this cycle"
+            )
+            return exchange_as_position
+
+        threshold = self._position_adjustment_threshold()
+        side_mismatch = current_position.get("side") != exchange_as_position.get("side")
+        qty_diff = abs(float(current_position.get("quantity") or 0.0) - exchange_as_position["quantity"])
+        if side_mismatch or qty_diff >= threshold:
+            self.log.warning(
+                "⚠️ Nautilus/Bybit position mismatch: "
+                f"nautilus={current_position.get('side')} {current_position.get('quantity')} "
+                f"{self.base_asset}, bybit={exchange_as_position['side']} "
+                f"{exchange_as_position['quantity']} {self.base_asset}; "
+                "using Bybit quantity for decision/execution sizing"
+            )
+            exchange_as_position["source"] = "bybit_exchange_override"
+            exchange_as_position["nautilus_position"] = current_position
+            return exchange_as_position
+
+        merged = dict(current_position)
+        merged["exchange_position"] = exchange_position
+        return merged
 
     def _execute_trade(
         self,
@@ -918,7 +1483,8 @@ class DeepSeekAIStrategy(Strategy):
         price_data: Dict[str, Any],
         technical_data: Dict[str, Any],
         current_position: Optional[Dict[str, Any]],
-    ):
+        risk_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
         Execute trading logic based on signal.
 
@@ -936,7 +1502,7 @@ class DeepSeekAIStrategy(Strategy):
         # Check if trading is paused
         if self.is_trading_paused:
             self.log.info("⏸️ Trading is paused - skipping signal execution")
-            return
+            return {"status": "skipped", "action": "none", "note": "trading_paused"}
         
         # Store signal and technical data for SL/TP calculation
         self.latest_signal_data = signal_data
@@ -955,21 +1521,25 @@ class DeepSeekAIStrategy(Strategy):
             self.log.warning(
                 f"⚠️ Signal confidence {confidence} below minimum {self.min_confidence}, skipping trade"
             )
-            return
+            return {
+                "status": "skipped",
+                "action": "none",
+                "note": f"confidence_below_min:{confidence}<{self.min_confidence}",
+            }
 
         # Handle HOLD signal
         if signal == 'HOLD':
             self.log.info("📊 Signal: HOLD - No action taken")
-            return
+            return {"status": "hold", "action": "none", "note": "hold_signal"}
 
         # Calculate target position size
         target_quantity = self._calculate_position_size(
-            signal_data, price_data, technical_data, current_position
+            signal_data, price_data, technical_data, current_position, risk_context
         )
 
         if target_quantity == 0:
             self.log.warning("⚠️ Calculated position size is 0, skipping trade")
-            return
+            return {"status": "skipped", "action": "none", "note": "zero_target_quantity"}
 
         # Determine order side
         target_side = 'long' if signal == 'BUY' else 'short'
@@ -979,8 +1549,22 @@ class DeepSeekAIStrategy(Strategy):
             self._manage_existing_position(
                 current_position, target_side, target_quantity, confidence
             )
+            return {
+                "status": "submitted",
+                "action": "manage_existing",
+                "target_side": target_side,
+                "target_quantity": target_quantity,
+                "note": "order_logic_dispatched",
+            }
         else:
             self._open_new_position(target_side, target_quantity)
+            return {
+                "status": "submitted",
+                "action": "open_new",
+                "target_side": target_side,
+                "target_quantity": target_quantity,
+                "note": "order_logic_dispatched",
+            }
 
     def _calculate_position_size(
         self,
@@ -988,89 +1572,131 @@ class DeepSeekAIStrategy(Strategy):
         price_data: Dict[str, Any],
         technical_data: Dict[str, Any],
         current_position: Optional[Dict[str, Any]],
+        risk_context: Optional[Dict[str, Any]] = None,
     ) -> float:
         """
         Calculate intelligent position size.
 
         Returns BTC quantity based on confidence, trend, and RSI.
         """
-        # Optional fixed-notional sizing for live/demo operations.
-        if self.fixed_trade_usdt > 0:
-            suggested_usdt = self.fixed_trade_usdt
-            sizing_reason = f"Fixed:${self.fixed_trade_usdt:.2f}"
-        else:
-            base_usdt = self.base_usdt
+        # Treat fixed_trade_usdt as the base target, but still vary exposure by
+        # confidence and risk conditions. This prevents the LLM confidence field
+        # from being ignored during live/demo operation.
+        base_usdt = self.fixed_trade_usdt if self.fixed_trade_usdt > 0 else self.base_usdt
 
-            # Confidence multiplier
-            conf_mult = self.position_config.get(
-                f"{signal_data['confidence'].lower()}_confidence_multiplier",
-                1.0
-            )
+        # Confidence multiplier
+        conf_mult = self.position_config.get(
+            f"{signal_data['confidence'].lower()}_confidence_multiplier",
+            1.0
+        )
 
-            # Trend multiplier
-            trend = technical_data.get('overall_trend', '震荡整理')
-            trend_mult = (
-                self.position_config['trend_strength_multiplier']
-                if trend in ['强势上涨', '强势下跌']
-                else 1.0
-            )
+        # Trend multiplier
+        trend = technical_data.get('overall_trend', 'mixed')
+        trend_mult = (
+            self.position_config['trend_strength_multiplier']
+            if trend in ['strong_up', 'strong_down']
+            else 1.0
+        )
 
-            # RSI multiplier (reduce size in extreme RSI)
-            rsi = technical_data.get('rsi', 50)
-            rsi_mult = (
-                self.rsi_extreme_mult
-                if rsi > self.rsi_extreme_upper or rsi < self.rsi_extreme_lower
-                else 1.0
-            )
+        # RSI multiplier (reduce size in extreme RSI)
+        rsi = technical_data.get('rsi', 50)
+        rsi_mult = (
+            self.rsi_extreme_mult
+            if rsi > self.rsi_extreme_upper or rsi < self.rsi_extreme_lower
+            else 1.0
+        )
 
-            # Calculate suggested USDT
-            suggested_usdt = base_usdt * conf_mult * trend_mult * rsi_mult
-            sizing_reason = (
-                f"Base:{base_usdt} × Conf:{conf_mult} × Trend:{trend_mult} × RSI:{rsi_mult}"
-            )
+        suggested_usdt = base_usdt * conf_mult * trend_mult * rsi_mult
+        sizing_reason = (
+            f"Base:{base_usdt} × Conf:{conf_mult} × Trend:{trend_mult} × RSI:{rsi_mult}"
+        )
 
         # Apply max position ratio limit
-        max_usdt = self.equity * self.position_config['max_position_ratio']
+        account_equity = self._account_equity_for_sizing(risk_context)
+        available_balance = self._available_balance_for_sizing(risk_context)
+        max_usdt = account_equity * self.position_config['max_position_ratio']
+        if available_balance is not None and available_balance > 0:
+            max_usdt = min(max_usdt, available_balance * self.leverage * 0.95)
         final_usdt = min(suggested_usdt, max_usdt)
 
-        # Enforce Binance minimum notional requirement ($100)
+        # Enforce a conservative minimum notional requirement.
         MIN_NOTIONAL_USDT = 100.0
         if final_usdt < MIN_NOTIONAL_USDT:
             final_usdt = MIN_NOTIONAL_USDT
 
-        # Convert to BTC quantity
+        # Convert to instrument quantity
         current_price = price_data['price']
-        btc_quantity = final_usdt / current_price
+        raw_quantity = final_usdt / current_price
 
         # Apply minimum trade amount
-        if btc_quantity < self.position_config['min_trade_amount']:
-            btc_quantity = self.position_config['min_trade_amount']
+        if raw_quantity < self.position_config['min_trade_amount']:
+            raw_quantity = self.position_config['min_trade_amount']
 
-        # Round to instrument precision
-        btc_quantity = round(btc_quantity, 3)  # Binance BTC precision
+        quantity = self._normalize_order_quantity(raw_quantity, log_skipped=False)
+        if quantity is None:
+            self._log_warning_safe("⚠️ Position size rounded below instrument minimum, skipping trade")
+            return 0.0
 
-        # CRITICAL: Re-check notional after rounding to ensure still >= $100
-        # Rounding can reduce the quantity below minimum notional threshold
-        actual_notional = btc_quantity * current_price
+        # Re-check notional after instrument rounding.
+        actual_notional = quantity * current_price
         if actual_notional < MIN_NOTIONAL_USDT:
-            # Increase quantity to meet minimum notional (round UP)
-            btc_quantity = MIN_NOTIONAL_USDT / current_price
-            # Round up to next 0.001 to ensure we stay above minimum
-            import math
-            btc_quantity = math.ceil(btc_quantity * 1000) / 1000
-            self.log.warning(
-                f"⚠️ Adjusted quantity after rounding: {btc_quantity:.3f} BTC "
-                f"to meet ${MIN_NOTIONAL_USDT} minimum notional"
-            )
+            quantity = self._normalize_order_quantity(MIN_NOTIONAL_USDT / current_price, log_skipped=False)
+            if quantity is None:
+                self._log_warning_safe("⚠️ Minimum notional quantity is below instrument minimum, skipping trade")
+                return 0.0
+            actual_notional = quantity * current_price
 
-        self.log.info(
+        self._log_info_safe(
             f"📊 Position Sizing: "
             f"{sizing_reason} "
-            f"= ${final_usdt:.2f} = {btc_quantity:.3f} BTC "
-            f"(notional: ${btc_quantity * current_price:.2f})"
+            f"= ${final_usdt:.2f} = {quantity:.6g} {self.base_asset} "
+            f"(notional: ${actual_notional:.2f}, equity_basis=${account_equity:.2f})"
         )
 
-        return btc_quantity
+        return quantity
+
+    def _account_equity_for_sizing(self, risk_context: Optional[Dict[str, Any]]) -> float:
+        """Return the best available account equity basis for sizing caps."""
+        wallet = (risk_context or {}).get("wallet") or {}
+        for key in ("total_equity", "usdt_equity", "total_wallet_balance", "usdt_wallet_balance"):
+            value = wallet.get(key)
+            if value is not None and float(value) > 0:
+                return float(value)
+        return float(self.equity)
+
+    def _available_balance_for_sizing(self, risk_context: Optional[Dict[str, Any]]) -> Optional[float]:
+        """Return available balance when exchange context provides it."""
+        wallet = (risk_context or {}).get("wallet") or {}
+        value = wallet.get("total_available_balance")
+        if value is not None and float(value) > 0:
+            return float(value)
+        value = wallet.get("usdt_available_to_withdraw")
+        if value is not None and float(value) > 0:
+            return float(value)
+        return None
+
+    def _normalize_order_quantity(self, quantity: float, log_skipped: bool = True) -> Optional[float]:
+        """Normalize a raw quantity through the instrument increment rules."""
+        if quantity <= 0 or self.instrument is None:
+            return None
+        try:
+            normalized = self.instrument.make_qty(quantity)
+        except Exception as e:
+            if log_skipped:
+                self._log_info_safe(
+                    f"✅ Quantity delta {quantity:.8f} {self.base_asset} is below "
+                    f"instrument increment; skipping adjustment ({e})"
+                )
+            return None
+
+        normalized_float = float(normalized)
+        if normalized_float <= 0:
+            if log_skipped:
+                self._log_info_safe(
+                    f"✅ Quantity delta {quantity:.8f} {self.base_asset} rounded to zero; skipping"
+                )
+            return None
+        return normalized_float
 
     def _manage_existing_position(
         self,
@@ -1086,35 +1712,39 @@ class DeepSeekAIStrategy(Strategy):
         # Same direction - adjust position
         if target_side == current_side:
             size_diff = target_quantity - current_qty
-            threshold = self.position_config['adjustment_threshold']
+            threshold = self._position_adjustment_threshold()
 
             if abs(size_diff) < threshold:
                 self.log.info(
-                    f"✅ Position size appropriate ({current_qty:.3f} BTC), no adjustment needed"
+                    f"✅ Position size appropriate ({current_qty:.6g} {self.base_asset}), no adjustment needed"
                 )
+                return
+
+            order_quantity = self._normalize_order_quantity(abs(size_diff))
+            if order_quantity is None:
                 return
 
             if size_diff > 0:
                 # Add to position
                 self._submit_order(
                     side=OrderSide.BUY if target_side == 'long' else OrderSide.SELL,
-                    quantity=abs(size_diff),
+                    quantity=order_quantity,
                     reduce_only=False,
                 )
                 self.log.info(
-                    f"📈 Adding to {target_side} position: {abs(size_diff):.3f} BTC "
-                    f"({current_qty:.3f} → {target_quantity:.3f})"
+                    f"📈 Adding to {target_side} position: {order_quantity:.6g} {self.base_asset} "
+                    f"({current_qty:.6g} → {target_quantity:.6g})"
                 )
             else:
                 # Reduce position
                 self._submit_order(
                     side=OrderSide.SELL if target_side == 'long' else OrderSide.BUY,
-                    quantity=abs(size_diff),
+                    quantity=order_quantity,
                     reduce_only=True,
                 )
                 self.log.info(
-                    f"📉 Reducing {target_side} position: {abs(size_diff):.3f} BTC "
-                    f"({current_qty:.3f} → {target_quantity:.3f})"
+                    f"📉 Reducing {target_side} position: {order_quantity:.6g} {self.base_asset} "
+                    f"({current_qty:.6g} → {target_quantity:.6g})"
                 )
 
         # Opposite direction - reverse position
@@ -1168,7 +1798,9 @@ class DeepSeekAIStrategy(Strategy):
             quantity=quantity,
         )
 
-        self.log.info(f"🚀 Opening {side} position: {quantity:.3f} BTC (with bracket SL/TP)")
+        self.log.info(
+            f"🚀 Opening {side} position: {quantity:.6g} {self.base_asset} (with bracket SL/TP)"
+        )
 
     def _submit_order(
         self,
@@ -1177,17 +1809,22 @@ class DeepSeekAIStrategy(Strategy):
         reduce_only: bool = False,
     ):
         """Submit market order to exchange."""
+        normalized_quantity = self._normalize_order_quantity(quantity)
+        if normalized_quantity is None:
+            return
+        quantity = normalized_quantity
+
         if self._is_dry_run():
             self.log.info(
-                f"🧪 DRY RUN: Simulated {side.name} market order {quantity:.3f} BTC "
+                f"🧪 DRY RUN: Simulated {side.name} market order {quantity:.6g} {self.base_asset} "
                 f"(reduce_only={reduce_only})"
             )
             return
 
         if quantity < self.position_config['min_trade_amount']:
             self.log.warning(
-                f"⚠️ Order quantity {quantity:.3f} below minimum "
-                f"{self.position_config['min_trade_amount']:.3f}, skipping"
+                f"⚠️ Order quantity {quantity:.6g} below minimum "
+                f"{self.position_config['min_trade_amount']:.6g}, skipping"
             )
             return
 
@@ -1204,7 +1841,7 @@ class DeepSeekAIStrategy(Strategy):
         self.submit_order(order)
 
         self.log.info(
-            f"📤 Submitted {side.name} market order: {quantity:.3f} BTC "
+            f"📤 Submitted {side.name} market order: {quantity:.6g} {self.base_asset} "
             f"(reduce_only={reduce_only})"
         )
     
@@ -1230,16 +1867,21 @@ class DeepSeekAIStrategy(Strategy):
         quantity : float
             Quantity to trade
         """
+        normalized_quantity = self._normalize_order_quantity(quantity)
+        if normalized_quantity is None:
+            return
+        quantity = normalized_quantity
+
         if quantity < self.position_config['min_trade_amount']:
             self.log.warning(
-                f"⚠️ Order quantity {quantity:.3f} below minimum "
-                f"{self.position_config['min_trade_amount']:.3f}, skipping"
+                f"⚠️ Order quantity {quantity:.6g} below minimum "
+                f"{self.position_config['min_trade_amount']:.6g}, skipping"
             )
             return
 
         if self._is_dry_run():
             self.log.info(
-                f"🧪 DRY RUN: Simulated bracket order {side.name} {quantity:.3f} BTC "
+                f"🧪 DRY RUN: Simulated bracket order {side.name} {quantity:.6g} {self.base_asset} "
                 f"(entry + SL + TP not submitted)"
             )
             return
@@ -1312,7 +1954,7 @@ class DeepSeekAIStrategy(Strategy):
             f"   Entry: ~${entry_price:,.2f} (MARKET)\n"
             f"   Stop Loss: ${stop_loss_price:,.2f} ({((stop_loss_price/entry_price - 1) * 100):.2f}%)\n"
             f"   Take Profit: ${tp_price:,.2f} ({((tp_price/entry_price - 1) * 100):.2f}%)\n"
-            f"   Quantity: {quantity:.3f}\n"
+            f"   Quantity: {quantity:.6g} {self.base_asset}\n"
             f"   Confidence: {confidence}"
         )
 
@@ -1335,7 +1977,7 @@ class DeepSeekAIStrategy(Strategy):
             self.submit_order_list(bracket_order_list)
 
             self.log.info(
-                f"✅ Submitted bracket order: {side.name} {quantity:.3f} BTC with SL/TP\n"
+                f"✅ Submitted bracket order: {side.name} {quantity:.6g} {self.base_asset} with SL/TP\n"
                 f"   OrderList ID: {bracket_order_list.id}"
             )
 
@@ -1840,7 +2482,7 @@ class DeepSeekAIStrategy(Strategy):
             # Get current position
             current_position = self._get_current_position_data()
             
-            position_info = {
+            position_info: Dict[str, Any] = {
                 'has_position': current_position is not None,
             }
             

@@ -1,198 +1,301 @@
 """
-Professional unit tests for DeepSeek Strategy components.
+Unit tests for strategy-adjacent components (minimal deps).
 
-This file tests individual functions in isolation with mocked dependencies.
+Avoids importing `strategy` package `__init__` when NautilusTrader is unavailable.
 """
+
+from __future__ import annotations
+
+import importlib.util
+import json
 import sys
 from pathlib import Path
-from decimal import Decimal
-from unittest.mock import Mock, patch, MagicMock
-import json
+from unittest.mock import Mock
 
-# Add parent directory to path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 
+def _load_deepseek_strategy_module():
+    path = ROOT / "strategy" / "deepseek_strategy.py"
+    spec = importlib.util.spec_from_file_location("deepseek_strategy_standalone", path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("nautilus_trader") is None,
+    reason="nautilus_trader not installed",
+)
 def test_position_sizing_respects_minimum_notional():
     """Test that position sizing enforces Binance $100 minimum notional."""
-    from strategy.deepseek_strategy import DeepSeekAIStrategy
+    mod = _load_deepseek_strategy_module()
+    DeepSeekAIStrategy = mod.DeepSeekAIStrategy
 
-    # Create minimal strategy instance
     strategy = DeepSeekAIStrategy.__new__(DeepSeekAIStrategy)
     strategy.equity = 400.0
+    strategy.base_usdt = 30.0
+    strategy.fixed_trade_usdt = 0.0
+    strategy.leverage = 10.0
+    strategy.rsi_extreme_mult = 0.7
+    strategy.rsi_extreme_upper = 75.0
+    strategy.rsi_extreme_lower = 25.0
+    strategy.base_asset = "BTC"
+    strategy.instrument = object()
+    strategy._normalize_order_quantity = lambda quantity, log_skipped=True: float(quantity)
+    strategy._log_warning_safe = lambda *_args, **_kwargs: None
+    strategy._log_info_safe = lambda *_args, **_kwargs: None
     strategy.position_config = {
-        'base_usdt_amount': 30.0,  # Below minimum
+        'high_confidence_multiplier': 1.5,
+        'medium_confidence_multiplier': 1.0,
+        'low_confidence_multiplier': 0.5,
         'max_position_ratio': 0.10,
         'min_trade_amount': 0.001,
-        'confidence_multipliers': {'HIGH': 1.5, 'MEDIUM': 1.0, 'LOW': 0.5},
         'trend_strength_multiplier': 1.2,
-        'rsi_adjustment': 0.7,
     }
     strategy.latest_signal_data = {'confidence': 'MEDIUM'}
     strategy.latest_technical_data = {'trend': 'BULLISH', 'rsi': 0.3}
     strategy.latest_price_data = {'price': 90000.0}
-    strategy.log = Mock()
 
-    # Calculate position size
-    quantity = strategy._calculate_position_size()
+    quantity = strategy._calculate_position_size(
+        signal_data={"confidence": "MEDIUM"},
+        price_data={"price": 90000.0},
+        technical_data={"overall_trend": "mixed", "rsi": 50.0},
+        current_position=None,
+        risk_context=None,
+    )
     notional_value = quantity * 90000.0
-
-    # Assert minimum notional is met
-    assert notional_value >= 100.0, f"Notional ${notional_value:.2f} below $100 minimum"
-    print(f"✅ Position sizing: {quantity:.6f} BTC (${notional_value:.2f}) >= $100 minimum")
+    assert notional_value >= 100.0
 
 
+@pytest.mark.skipif(
+    importlib.util.find_spec("nautilus_trader") is None,
+    reason="nautilus_trader not installed",
+)
 def test_position_sizing_scales_with_confidence():
-    """Test that higher confidence results in larger position size."""
-    from strategy.deepseek_strategy import DeepSeekAIStrategy
+    mod = _load_deepseek_strategy_module()
+    DeepSeekAIStrategy = mod.DeepSeekAIStrategy
 
     strategy = DeepSeekAIStrategy.__new__(DeepSeekAIStrategy)
-    strategy.equity = 400.0
+    strategy.equity = 10000.0
+    strategy.base_usdt = 1000.0
+    strategy.fixed_trade_usdt = 0.0
+    strategy.leverage = 10.0
+    strategy.rsi_extreme_mult = 0.7
+    strategy.rsi_extreme_upper = 75.0
+    strategy.rsi_extreme_lower = 25.0
+    strategy.base_asset = "BTC"
+    strategy.instrument = object()
+    strategy._normalize_order_quantity = lambda quantity, log_skipped=True: float(quantity)
+    strategy._log_warning_safe = lambda *_args, **_kwargs: None
+    strategy._log_info_safe = lambda *_args, **_kwargs: None
     strategy.position_config = {
-        'base_usdt_amount': 100.0,
-        'max_position_ratio': 0.10,
+        'high_confidence_multiplier': 1.5,
+        'medium_confidence_multiplier': 1.0,
+        'low_confidence_multiplier': 0.5,
+            'max_position_ratio': 0.50,
         'min_trade_amount': 0.001,
-        'confidence_multipliers': {'HIGH': 1.5, 'MEDIUM': 1.0, 'LOW': 0.5},
         'trend_strength_multiplier': 1.2,
-        'rsi_adjustment': 0.7,
     }
-    strategy.latest_technical_data = {'trend': 'BULLISH', 'rsi': 0.3}
-    strategy.latest_price_data = {'price': 90000.0}
-    strategy.log = Mock()
 
     sizes = {}
-    for confidence in ['LOW', 'MEDIUM', 'HIGH']:
-        strategy.latest_signal_data = {'confidence': confidence}
-        sizes[confidence] = strategy._calculate_position_size()
-
-    assert sizes['LOW'] < sizes['MEDIUM'] < sizes['HIGH'], \
-        "Position size should increase with confidence"
-    print(f"✅ Confidence scaling: LOW={sizes['LOW']:.6f} < MEDIUM={sizes['MEDIUM']:.6f} < HIGH={sizes['HIGH']:.6f}")
-
-
-def test_deepseek_response_parsing():
-    """Test parsing of DeepSeek AI JSON response."""
-    from ai_client.deepseek_client import DeepSeekClient
-
-    # Mock response from DeepSeek
-    mock_response = {
-        "signal": "BUY",
-        "confidence": "HIGH",
-        "reason": "Strong bullish momentum with RSI oversold",
-        "stop_loss": 0.01,
-        "take_profit": 0.03
-    }
-
-    # Mock the OpenAI client
-    with patch('ai_client.deepseek_client.OpenAI') as MockOpenAI:
-        mock_client = MockOpenAI.return_value
-        mock_choice = Mock()
-        mock_choice.message.content = json.dumps(mock_response)
-        mock_client.chat.completions.create.return_value = Mock(choices=[mock_choice])
-
-        # Create client and get analysis
-        client = DeepSeekClient(api_key="test_key", model="test_model")
-        result = client.get_trading_signal(
-            prompt="test prompt",
-            kline_data=[],
-            indicators={},
-            current_position=None
+    for confidence in ('LOW', 'MEDIUM', 'HIGH'):
+        sizes[confidence] = strategy._calculate_position_size(
+            signal_data={"confidence": confidence},
+            price_data={"price": 90000.0},
+            technical_data={"overall_trend": "mixed", "rsi": 50.0},
+            current_position=None,
+            risk_context=None,
         )
 
-        assert result['signal'] == 'BUY'
-        assert result['confidence'] == 'HIGH'
-        assert 'reason' in result
-        print(f"✅ DeepSeek response parsing: signal={result['signal']}, confidence={result['confidence']}")
+    assert sizes['LOW'] < sizes['MEDIUM'] < sizes['HIGH']
 
 
-def test_stop_loss_calculation_uses_support():
-    """Test that stop loss is calculated using support levels."""
-    from strategy.deepseek_strategy import DeepSeekAIStrategy
+def test_deepseek_synthesis_parse_and_journal_fields():
+    """DeepSeekAnalyzer accepts synthesis JSON and fills legacy bridge fields."""
+    import types
+
+    synth = {
+        "signal": "HOLD",
+        "confidence": "MEDIUM",
+        "regime": "range_compress",
+        "thesis": "Balanced liquidity; wait for breakout.",
+        "invalidation": "Close above resistance invalidates neutrality.",
+        "execution_note": "Scale only after spread tightens.",
+        "volume_note": "rvol muted",
+        "risk_assessment": "MEDIUM",
+        "trend_strength": "MODERATE",
+    }
+
+    openai_fake = types.ModuleType("openai")
+
+    MockOpenAI = Mock()
+    openai_fake.OpenAI = MockOpenAI
+
+    mock_client = MockOpenAI.return_value
+    mock_choice = Mock()
+    mock_choice.message.content = json.dumps(synth)
+    mock_choice.message.reasoning_content = "think: condensed"
+    mock_client.chat.completions.create.return_value = Mock(choices=[mock_choice])
+
+    spec_ds = importlib.util.spec_from_file_location(
+        "deepseek_standalone_mod", ROOT / "utils" / "deepseek_client.py"
+    )
+    assert spec_ds and spec_ds.loader
+
+    ds_mod_prev = sys.modules.get("deepseek_standalone_mod")
+    openai_prev = sys.modules.get("openai")
+    try:
+        sys.modules["openai"] = openai_fake
+        ds_mod = importlib.util.module_from_spec(spec_ds)
+        sys.modules["deepseek_standalone_mod"] = ds_mod
+        spec_ds.loader.exec_module(ds_mod)
+        DeepSeekAnalyzer = ds_mod.DeepSeekAnalyzer
+
+        client = DeepSeekAnalyzer(
+            api_key="k", model="m", instrument_id="X-LINEAR.BYBIT", bar_type="X-1-MINUTE-LAST"
+        )
+        price_data = {"price": 100.0, "instrument_id": "X-LINEAR.BYBIT", "bar_type": "X-1-MINUTE-LAST"}
+        technical_data = {"rsi": 50.0}
+
+        result = client.analyze(price_data, technical_data)
+    finally:
+        if ds_mod_prev is not None:
+            sys.modules["deepseek_standalone_mod"] = ds_mod_prev
+        else:
+            sys.modules.pop("deepseek_standalone_mod", None)
+        if openai_prev is not None:
+            sys.modules["openai"] = openai_prev
+        else:
+            sys.modules.pop("openai", None)
+
+    assert result["signal"] == "HOLD"
+    assert result["thesis"]
+    assert result.get("reason") == result["thesis"]
+    assert "stop_loss" in result and "take_profit" in result
+
+
+def test_trade_journal_writes_header_once():
+    import tempfile
+
+    from utils.trade_journal import TradeJournalCSV
+
+    with tempfile.TemporaryDirectory() as tmp:
+        p = Path(tmp) / "tj.csv"
+        j = TradeJournalCSV(str(p))
+        j.append({"instrument_id": "A", "decision_cycle_trigger": "on_bar"})
+        j.append({"instrument_id": "B", "decision_cycle_trigger": "on_bar"})
+        text = p.read_text(encoding="utf-8").strip().splitlines()
+        assert len(text) == 3
+        header_count = sum(1 for line in text if line.startswith("decision_ts_utc"))
+        assert header_count == 1
+
+
+def test_ob_tf_window_summaries_shape():
+    spec_ob = importlib.util.spec_from_file_location(
+        "orderbook_standalone_mod", ROOT / "indicators" / "orderbook_manager.py"
+    )
+    assert spec_ob and spec_ob.loader
+
+    prev = sys.modules.get("orderbook_standalone_mod")
+    try:
+        ob_mod = importlib.util.module_from_spec(spec_ob)
+        sys.modules["orderbook_standalone_mod"] = ob_mod
+        spec_ob.loader.exec_module(ob_mod)
+
+        OrderBookManager = ob_mod.OrderBookManager
+        DepthSnapshot = ob_mod.DepthSnapshot
+    finally:
+        if prev is not None:
+            sys.modules["orderbook_standalone_mod"] = prev
+        else:
+            sys.modules.pop("orderbook_standalone_mod", None)
+
+    mgr = OrderBookManager(
+        depth_levels=2,
+        depth_buffer_size=50,
+        trade_buffer_size=500,
+        feature_buffer_size=50,
+    )
+
+    anchor = int(170e9)
+
+    def _snap(spread_bps: float, mid: float, regime: str) -> None:
+        half = spread_bps * mid / 20_000.0
+        snap = DepthSnapshot(
+            ts_event=anchor,
+            bid_prices=[mid - half],
+            bid_sizes=[10.0],
+            ask_prices=[mid + half],
+            ask_sizes=[10.0],
+            bid_counts=[1],
+            ask_counts=[1],
+        )
+        mgr._ingest_snapshot(snap)
+        mgr._feature_buf[-1].depth_regime = regime
+
+    mid = 100.0
+    for _ in range(22):
+        _snap(12.0, mid, "normal")
+
+    out = mgr.get_tf_window_summaries(bar_period_sec=60, now_ns=anchor)
+
+    assert out.get("ready") is True
+    assert out["W_fast_sec"] == 60
+    assert out["W_main_sec"] == 60
+    assert out["W_context_sec"] == 180
+
+    fast = out["fast"]
+    assert fast["ready"] is True
+    assert "spread_mean_bps" in fast
+    assert "labels" in fast and "liquidity" in fast["labels"]
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("nautilus_trader") is None,
+    reason="nautilus_trader not installed",
+)
+def test_stop_loss_calculation_stub():
+    mod = _load_deepseek_strategy_module()
+    DeepSeekAIStrategy = mod.DeepSeekAIStrategy
 
     strategy = DeepSeekAIStrategy.__new__(DeepSeekAIStrategy)
     strategy.sl_use_support_resistance = True
-    strategy.sl_buffer_pct = 0.001  # 0.1% buffer
+    strategy.sl_buffer_pct = 0.001
     strategy.latest_technical_data = {'support': 89000.0}
     strategy.latest_price_data = {'price': 91000.0}
     strategy.latest_signal_data = {'confidence': 'HIGH'}
     strategy.sl_pct_config = {'HIGH': 0.01}
-    strategy.log = Mock()
 
-    # Calculate stop loss
     current_price = 91000.0
-    expected_sl = 89000.0 * (1 - 0.001)  # support with buffer
+    expected_sl = 89000.0 * (1 - 0.001)
 
-    # Mock the method
     strategy._calculate_stop_loss_price = lambda side, price: expected_sl
     sl_price = strategy._calculate_stop_loss_price('BUY', current_price)
-
-    assert abs(sl_price - expected_sl) < 1.0, \
-        f"Stop loss {sl_price} should be near support {expected_sl}"
-    print(f"✅ Stop loss calculation: ${sl_price:.2f} (support: $89,000)")
+    assert abs(sl_price - expected_sl) < 1.0
 
 
-def test_take_profit_scales_with_confidence():
-    """Test that take profit percentage scales with confidence level."""
-    from strategy.deepseek_strategy import DeepSeekAIStrategy
+@pytest.mark.skipif(
+    importlib.util.find_spec("nautilus_trader") is None,
+    reason="nautilus_trader not installed",
+)
+def test_take_profit_scaling_stub():
+    mod = _load_deepseek_strategy_module()
+    DeepSeekAIStrategy = mod.DeepSeekAIStrategy
 
     strategy = DeepSeekAIStrategy.__new__(DeepSeekAIStrategy)
     strategy.tp_pct_config = {'HIGH': 0.03, 'MEDIUM': 0.02, 'LOW': 0.01}
     strategy.latest_price_data = {'price': 90000.0}
-    strategy.log = Mock()
 
     current_price = 90000.0
 
     for confidence, expected_pct in [('LOW', 0.01), ('MEDIUM', 0.02), ('HIGH', 0.03)]:
         strategy.latest_signal_data = {'confidence': confidence}
         expected_tp = current_price * (1 + expected_pct)
-
-        # Mock the method
         strategy._calculate_take_profit_price = lambda side, price: expected_tp
         tp_price = strategy._calculate_take_profit_price('BUY', current_price)
-
-        assert abs(tp_price - expected_tp) < 1.0, \
-            f"TP for {confidence} should be ${expected_tp:.2f}"
-
-    print(f"✅ Take profit scaling: LOW=1%, MEDIUM=2%, HIGH=3%")
-
-
-def run_all_tests():
-    """Run all unit tests."""
-    tests = [
-        ("Position Sizing - Minimum Notional", test_position_sizing_respects_minimum_notional),
-        ("Position Sizing - Confidence Scaling", test_position_sizing_scales_with_confidence),
-        ("DeepSeek Response Parsing", test_deepseek_response_parsing),
-        ("Stop Loss Calculation", test_stop_loss_calculation_uses_support),
-        ("Take Profit Scaling", test_take_profit_scales_with_confidence),
-    ]
-
-    print("\n" + "="*60)
-    print("Running Unit Tests for Strategy Components")
-    print("="*60 + "\n")
-
-    passed = 0
-    failed = 0
-
-    for name, test_func in tests:
-        try:
-            print(f"\nTest: {name}")
-            print("-" * 60)
-            test_func()
-            passed += 1
-        except Exception as e:
-            print(f"❌ FAILED: {name}")
-            print(f"   Error: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            failed += 1
-
-    print("\n" + "="*60)
-    print(f"Results: {passed} passed, {failed} failed")
-    print("="*60 + "\n")
-
-    return failed == 0
-
-
-if __name__ == "__main__":
-    success = run_all_tests()
-    sys.exit(0 if success else 1)
+        assert abs(tp_price - expected_tp) < 1.0

@@ -5,7 +5,7 @@ strategy:
   instrument_id: "BTCUSDT-LINEAR.BYBIT"
 
   # Bar configuration
-  bar_type: "BTCUSDT-LINEAR.BYBIT-15-MINUTE-LAST-EXTERNAL"  # Production: 15-minute bars
+  bar_type: "BTCUSDT-LINEAR.BYBIT-5-MINUTE-LAST-EXTERNAL"  # Production default: 5-minute bars
 
   # Capital and leverage
   equity: 100000  # USDT reference equity for sizing caps
@@ -22,7 +22,7 @@ strategy:
     trend_strength_multiplier: 1.2
     min_trade_amount: 0.001  # Minimum BTC amount
 
-  # Technical indicators parameters - Production: Standard periods for 15-minute timeframe
+  # Technical indicators parameters - Standard periods (works with default 5m bars)
   indicators:
     sma_periods: [5, 20, 50]  # Standard SMA periods
     ema_periods: [12, 26]     # Standard EMA periods for MACD
@@ -61,13 +61,13 @@ strategy:
     rsi_extreme_threshold_lower: 25
     rsi_extreme_multiplier: 0.7
     
-    # Stop Loss & Take Profit (自动止损止盈)
-    enable_auto_sl_tp: true  # 启用自动止损止盈
-    sl_use_support_resistance: true  # 使用支撑阻力位作为止损
-    sl_buffer_pct: 0.001  # 止损缓冲 (0.1% 在支撑/阻力位之外)
-    tp_high_confidence_pct: 0.03  # 高信心止盈: 3%
-    tp_medium_confidence_pct: 0.02  # 中等信心止盈: 2%
-    tp_low_confidence_pct: 0.01  # 低信心止盈: 1%
+    # Stop Loss & Take Profit — scalp-tuned targets
+    enable_auto_sl_tp: true
+    sl_use_support_resistance: true
+    sl_buffer_pct: 0.001
+    tp_high_confidence_pct: 0.008   # 0.8% — scalp-appropriate for 5m ETH
+    tp_medium_confidence_pct: 0.005 # 0.5%
+    tp_low_confidence_pct: 0.003    # 0.3%
     
     # OCO (One-Cancels-the-Other) Management
     enable_oco: true  # 启用 OCO 自动取消机制
@@ -77,17 +77,17 @@ strategy:
     oco_redis_password: null  # Redis 密码 (如果需要)
     oco_group_ttl_hours: 24  # OCO 组过期时间（小时）
     
-    # Trailing Stop Loss (移动止损)
-    enable_trailing_stop: true  # 启用移动止损
-    trailing_activation_pct: 0.01  # 激活阈值: 盈利 1% 后启动移动止损
-    trailing_distance_pct: 0.005  # 跟踪距离: 距离当前价 0.5%
-    trailing_update_threshold_pct: 0.002  # 更新阈值: 价格移动 0.2% 才更新止损
+    # Trailing Stop Loss — scalp-tuned (lower thresholds for 5m bars)
+    enable_trailing_stop: true
+    trailing_activation_pct: 0.003    # Activate after 0.3% profit (was 1%)
+    trailing_distance_pct: 0.002      # Trail 0.2% behind price (was 0.5%)
+    trailing_update_threshold_pct: 0.001  # Update on 0.1% moves (was 0.2%)
     
-    # Partial Take Profit (部分止盈)
-    enable_partial_tp: true  # 启用部分止盈
-    partial_tp_levels:  # 止盈级别配置 (百分比, 仓位比例)
-      - {profit_pct: 0.02, position_pct: 0.5}  # 盈利2%时平50%仓位
-      - {profit_pct: 0.04, position_pct: 0.5}  # 盈利4%时平剩余50%仓位
+    # Partial Take Profit — scalp-tuned
+    enable_partial_tp: true
+    partial_tp_levels:
+      - {profit_pct: 0.004, position_pct: 0.5}  # Take 50% at 0.4% profit
+      - {profit_pct: 0.008, position_pct: 0.5}  # Take remaining 50% at 0.8% profit
 
   # Telegram Notifications (Telegram 通知)
   telegram:
@@ -121,7 +121,7 @@ strategy:
     log_min_seconds: 60              # Additional wall-clock throttle: max one OB summary per minute
 
   # Timing
-  timer_interval_sec: 60   # 1-minute decision cycle for active demo iteration
+  timer_interval_sec: 300   # 5-minute decision cycle (aligns with default TIMEFRAME=5m)
   warmup_bars: 500         # Historical bars fetched at startup (Bybit API cap: 1000)
 
 # Logging configuration

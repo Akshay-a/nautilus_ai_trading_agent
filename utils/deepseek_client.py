@@ -73,11 +73,11 @@ class DeepSeekAnalyzer:
     def _derive_timeframe_label(self, bar_type: str) -> str:
         """Build readable timeframe label from Nautilus bar_type."""
         if not bar_type:
-            return "15-minute"
+            return "5-minute"
         text = bar_type.upper()
         m = re.search(r"-([0-9]+)-(MINUTE|HOUR|DAY)-", text)
         if not m:
-            return "15-minute"
+            return "5-minute"
         qty = int(m.group(1))
         unit = m.group(2).lower()
         return f"{qty}-{unit}"
@@ -131,7 +131,7 @@ class DeepSeekAnalyzer:
         self.timeframe_label = ctx["timeframe_label"]
         self._context_key = new_key
 
-        if changed and reset_history:
+        if changed and reset_history and previous_key is not None:
             stale = len(self.signal_history)
             self.signal_history.clear()
             self._log_warning(
@@ -152,12 +152,23 @@ class DeepSeekAnalyzer:
     def _build_system_prompt(self) -> str:
         """Build dynamic system prompt tied to active instrument context."""
         return (
-            "You are an elite algorithmic trading system specializing in "
-            f"{self.pair_label} perpetual futures on {self.venue}. "
-            f"You analyze {self.timeframe_label} K-line data with precision, combining "
-            "technical indicators, market microstructure, and sentiment analysis. "
-            "Your decisions must be data-driven, risk-aware, and execution-aware "
-            "(spread/depth/liquidity). Always return responses strictly in JSON format."
+            f"You are an aggressive intraday SCALP TRADER on {self.pair_label} perpetuals "
+            f"({self.timeframe_label} bars, {self.venue}).\n\n"
+            "CORE SCALP TRADING RULES — follow these strictly:\n"
+            "1. TAKE PROFITS QUICKLY. If the position is profitable, your default bias is EXIT or REDUCE. "
+            "A small realized gain is always better than a large unrealized gain that evaporates.\n"
+            "2. CUT LOSSES FAST. If the position moves against entry, lean toward EXIT.\n"
+            "3. NEVER add to a retracing position. If uPnL was higher before and is now declining, "
+            "do NOT signal the same direction — signal HOLD or EXIT.\n"
+            "4. GIVE-BACK RULE: If position has given back >40% of its peak unrealized profit, "
+            "signal EXIT (the opposite direction signal).\n"
+            "5. When FLAT and evidence is mixed or weak, prefer HOLD. Only enter with clear conviction.\n"
+            "6. After exiting, wait for a fresh setup. Do not immediately re-enter the same direction.\n\n"
+            "POSITION MANAGEMENT PRIORITY:\n"
+            "- Profitable position → evaluate EXIT first, then HOLD, then ADD (rare, only on strong continuation)\n"
+            "- Losing position → evaluate EXIT first, then HOLD (never ADD)\n"
+            "- No position → evaluate entry with clear directional evidence\n\n"
+            "Respond ONLY in English. Output a single JSON object. No markdown, no prose outside JSON."
         )
 
     def _log_info(self, msg: str):
@@ -190,6 +201,7 @@ class DeepSeekAnalyzer:
         technical_data: Dict[str, Any],
         sentiment_data: Optional[Dict[str, Any]] = None,
         current_position: Optional[Dict[str, Any]] = None,
+        risk_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Analyze market conditions and generate trading signal.
@@ -204,6 +216,8 @@ class DeepSeekAnalyzer:
             Market sentiment data
         current_position : Dict, optional
             Current position information
+        risk_context : Dict, optional
+            Exchange account, open order, recent execution, and realized P&L context
 
         Returns
         -------
@@ -213,8 +227,8 @@ class DeepSeekAnalyzer:
                 "signal": "BUY|SELL|HOLD",
                 "confidence": "HIGH|MEDIUM|LOW",
                 "reason": str,
-                "stop_loss": float,
-                "take_profit": float,
+                "stop_loss/take_profit": optional floats (backward compatibility),
+                "regime/thesis/invalidation/execution_note/volume_note": synthesis fields,
                 "timestamp": str
             }
         """
@@ -223,7 +237,7 @@ class DeepSeekAnalyzer:
         for attempt in range(self.max_retries):
             try:
                 signal = self._analyze_with_retry(
-                    price_data, technical_data, sentiment_data, current_position
+                    price_data, technical_data, sentiment_data, current_position, risk_context
                 )
 
                 if signal and not signal.get("is_fallback", False):
@@ -234,9 +248,60 @@ class DeepSeekAnalyzer:
             except Exception as e:
                 self._log_error(f"❌ Analysis attempt {attempt + 1} failed: {type(e).__name__}: {e}")
                 if attempt == self.max_retries - 1:
-                    return self._create_fallback_signal(price_data)
+                    return self._emit_fallback(price_data)
 
-        return self._create_fallback_signal(price_data)
+        return self._emit_fallback(price_data)
+
+    def _finalize_signal_compat(self, signal_data: Dict[str, Any], price_data: Dict[str, Any]) -> None:
+        """
+        Bridge synthesis-era schema to downstream expectations (telemetry, brackets).
+
+        Keeps synthetic stop_loss/take_profit placeholders for legacy dashboards only —
+        sizing and bracket TP/SL remain strategy-computed elsewhere.
+        """
+        thesis_raw = signal_data.get("thesis") or ""
+        legacy_raw = signal_data.get("reason") or ""
+
+        thesis = thesis_raw.strip() if isinstance(thesis_raw, str) else str(thesis_raw)
+        legacy = legacy_raw.strip() if isinstance(legacy_raw, str) else str(legacy_raw)
+
+        if thesis:
+            signal_data["reason"] = thesis
+            signal_data["thesis"] = thesis
+        elif legacy:
+            signal_data["reason"] = legacy
+            signal_data["thesis"] = legacy
+        signal_data.setdefault("trend_strength", "MODERATE")
+
+        px = price_data.get("price")
+        try:
+            price = float(px) if px is not None else 0.0
+        except (TypeError, ValueError):
+            price = 0.0
+
+        sig = str(signal_data.get("signal") or "HOLD").upper()
+
+        def _needs_fill(val: Any) -> bool:
+            if val is None:
+                return True
+            try:
+                f = float(val)
+            except (TypeError, ValueError):
+                return True
+            return f <= 0
+
+        sl = signal_data.get("stop_loss")
+        tp = signal_data.get("take_profit")
+        if price > 0 and _needs_fill(sl) and _needs_fill(tp):
+            if sig == "BUY":
+                signal_data["stop_loss"] = round(price * 0.985, 2)
+                signal_data["take_profit"] = round(price * 1.02, 2)
+            elif sig == "SELL":
+                signal_data["stop_loss"] = round(price * 1.015, 2)
+                signal_data["take_profit"] = round(price * 0.98, 2)
+            else:
+                signal_data["stop_loss"] = round(price, 8)
+                signal_data["take_profit"] = round(price, 8)
 
     def _analyze_with_retry(
         self,
@@ -244,18 +309,20 @@ class DeepSeekAnalyzer:
         technical_data: Dict[str, Any],
         sentiment_data: Optional[Dict[str, Any]],
         current_position: Optional[Dict[str, Any]],
+        risk_context: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
         """Internal analysis with single attempt."""
 
         # Build comprehensive prompt
         prompt = self._build_analysis_prompt(
-            price_data, technical_data, sentiment_data, current_position
+            price_data, technical_data, sentiment_data, current_position, risk_context
         )
         prompt_payload = self._build_prompt_payload(
             price_data=price_data,
             technical_data=technical_data,
             sentiment_data=sentiment_data,
             current_position=current_position,
+            risk_context=risk_context,
         )
         self._log_info(
             f"🤖 LLM Prompt Payload: {json.dumps(prompt_payload, ensure_ascii=False)}"
@@ -280,36 +347,76 @@ class DeepSeekAnalyzer:
         )
 
         # Parse response
-        result = response.choices[0].message.content
+        message = response.choices[0].message
+        result = message.content or ""
+        reasoning_content = getattr(message, "reasoning_content", None) or ""
         self._log_info(f"🤖 DeepSeek Raw Response: {result[:500]}")
+        if reasoning_content:
+            self._log_debug(
+                f"🧠 DeepSeek reasoning captured: {len(reasoning_content)} chars"
+            )
 
         signal_data = self._safe_parse_json(result)
 
         if signal_data is None:
             self._log_error(f"❌ JSON parse failed for response: {result[:200]}")
-            return self._create_fallback_signal(price_data)
+            fb = self._emit_fallback(price_data)
+            rc = fb.get("reasoning_content") or ""
+            snippet = reasoning_content.strip()[:2000] if reasoning_content else ""
+            fb["reasoning_content"] = (
+                rc + ("\nreasoner:" + snippet if snippet else "")
+                + "\n parse_fail:" + result[:480]
+            )
+            return fb
 
         self._log_info(
             f"🤖 LLM Response JSON: {json.dumps(signal_data, ensure_ascii=False)}"
         )
 
-        # Validate required fields
-        required_fields = ["signal", "reason", "stop_loss", "take_profit", "confidence"]
-        optional_fields = ["trend_strength", "risk_assessment"]
-
+        # Validate synthesis-required fields / legacy bridging
+        required_fields = ["signal", "confidence"]
+        synth_fields = (
+            "regime",
+            "thesis",
+            "invalidation",
+            "execution_note",
+            "volume_note",
+            "risk_assessment",
+        )
         if not all(field in signal_data for field in required_fields):
             missing = [f for f in required_fields if f not in signal_data]
             self._log_warning(f"⚠️ Missing required fields in signal data: {missing}")
-            return self._create_fallback_signal(price_data)
-        
-        # Set defaults for optional fields if missing
-        if "trend_strength" not in signal_data:
-            signal_data["trend_strength"] = "MODERATE"
-        if "risk_assessment" not in signal_data:
-            signal_data["risk_assessment"] = "MEDIUM"
+            return self._emit_fallback(price_data)
+
+        if "thesis" not in signal_data and "reason" in signal_data:
+            signal_data["thesis"] = signal_data["reason"]
+
+        thesis_val = signal_data.get("thesis") or ""
+        legacy_reason_val = signal_data.get("reason") or ""
+        if not str(thesis_val).strip() and not str(legacy_reason_val).strip():
+            self._log_warning(
+                "⚠️ Missing thesis/reason synthesis field in signal data."
+            )
+            return self._emit_fallback(price_data)
+
+        synth_missing = [f for f in synth_fields if f not in signal_data]
+        if synth_missing:
+            self._log_warning(
+                "⚠️ Missing synthesis structured fields "
+                f"({','.join(synth_missing)}) — patching defaults"
+            )
+            for fld in synth_missing:
+                signal_data.setdefault(
+                    fld,
+                    "MEDIUM" if fld == "risk_assessment" else "",
+                )
+
+        self._finalize_signal_compat(signal_data, price_data)
 
         # Add metadata
         signal_data["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        signal_data["reasoning_content"] = reasoning_content
+        signal_data["llm_model"] = self.model
 
         # Store in history
         self.signal_history.append(signal_data)
@@ -327,6 +434,7 @@ class DeepSeekAnalyzer:
         technical_data: Dict[str, Any],
         sentiment_data: Optional[Dict[str, Any]],
         current_position: Optional[Dict[str, Any]],
+        risk_context: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
         """
         Build a concise structured payload for audit logs/dashboard.
@@ -349,6 +457,23 @@ class DeepSeekAnalyzer:
 
         micro = price_data.get("microstructure") or {}
         micro_summary = {}
+        compact_windows = {}
+        tfw = micro.get("tf_windows")
+        if isinstance(tfw, dict):
+            compact_windows = {
+                k: tfw[k]
+                for k in ("W_fast_sec", "W_main_sec", "W_context_sec")
+                if k in tfw
+            }
+            for lbl in ("fast", "main", "context"):
+                node = tfw.get(lbl)
+                if isinstance(node, dict):
+                    compact_windows[f"{lbl}_spread_mean"] = node.get("spread_mean_bps")
+                    compact_windows[f"{lbl}_tfi"] = node.get("trade_flow_imbalance")
+                    labs = node.get("labels") or {}
+                    compact_windows[f"{lbl}_liquidity"] = labs.get("liquidity")
+                    compact_windows[f"{lbl}_pressure"] = labs.get("directional_pressure")
+
         for key in (
             "spread_bps",
             "tob_imbalance",
@@ -370,9 +495,25 @@ class DeepSeekAnalyzer:
             "macd_histogram",
             "support",
             "resistance",
+            "atr",
+            "atr_pct",
+            "dmi_dx",
+            "adx",
+            "dmi_pos",
+            "dmi_neg",
         ):
             if key in technical_data:
                 technical_summary[key] = technical_data.get(key)
+
+        for vol_key in (
+            "rvol",
+            "volume_zscore",
+            "volume_trend_slope",
+            "directional_volume_confirmation",
+            "volume_regime",
+        ):
+            if vol_key in technical_data:
+                technical_summary[vol_key] = technical_data.get(vol_key)
 
         sentiment_summary = None
         if sentiment_data:
@@ -380,6 +521,10 @@ class DeepSeekAnalyzer:
             for key in ("score", "label", "confidence", "timeframe", "source"):
                 if key in sentiment_data:
                     sentiment_summary[key] = sentiment_data.get(key)
+
+        position_health = None
+        if current_position and isinstance(current_position, dict):
+            position_health = current_position.get("position_health")
 
         return {
             "ts": price_data.get("timestamp"),
@@ -389,11 +534,42 @@ class DeepSeekAnalyzer:
             "volume": price_data.get("volume"),
             "price_change_pct": price_data.get("price_change"),
             "position": current_position,
+            "position_health": position_health,
+            "risk_context": self._compact_risk_context(risk_context),
             "technical": technical_summary,
             "microstructure": micro_summary,
             "kline_tail_5": kline_summary,
             "sentiment": sentiment_summary,
             "previous_signal": self.signal_history[-1] if self.signal_history else None,
+            "micro_tf_windows": compact_windows if compact_windows else None,
+        }
+
+    def _compact_risk_context(self, risk_context: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Return the model/audit-safe subset of exchange account context."""
+        if not risk_context:
+            return None
+
+        wallet = risk_context.get("wallet") or {}
+        position = risk_context.get("position")
+        open_orders = risk_context.get("open_orders") or []
+        trade_summary = risk_context.get("recent_trade_summary") or {}
+
+        return {
+            "source": risk_context.get("source"),
+            "ok": risk_context.get("ok"),
+            "fetched_at": risk_context.get("fetched_at"),
+            "wallet": {
+                "total_equity": wallet.get("total_equity"),
+                "total_available_balance": wallet.get("total_available_balance"),
+                "total_initial_margin": wallet.get("total_initial_margin"),
+                "total_maintenance_margin": wallet.get("total_maintenance_margin"),
+                "usdt_equity": wallet.get("usdt_equity"),
+                "usdt_wallet_balance": wallet.get("usdt_wallet_balance"),
+            } if wallet else None,
+            "exchange_position": position,
+            "open_orders_count": len(open_orders),
+            "open_orders": open_orders[:5],
+            "recent_trade_summary": trade_summary,
         }
 
     def _build_analysis_prompt(
@@ -402,6 +578,7 @@ class DeepSeekAnalyzer:
         technical_data: Dict[str, Any],
         sentiment_data: Optional[Dict[str, Any]],
         current_position: Optional[Dict[str, Any]],
+        risk_context: Optional[Dict[str, Any]],
     ) -> str:
         """Build comprehensive analysis prompt for DeepSeek."""
 
@@ -416,6 +593,7 @@ class DeepSeekAnalyzer:
 
         # Position info
         position_text = self._format_position_data(current_position)
+        risk_context_text = self._format_risk_context_data(risk_context)
         microstructure_text = self._format_microstructure_data(
             price_data.get("microstructure")
         )
@@ -425,247 +603,73 @@ class DeepSeekAnalyzer:
         if self.signal_history:
             last_signal = self.signal_history[-1]
             signal_text = (
-                f"\n【Previous Signal】\n"
-                f"Signal: {last_signal.get('signal', 'N/A')}\n"
-                f"Confidence: {last_signal.get('confidence', 'N/A')}"
+                f"PREV_SIG {last_signal.get('signal')} conf={last_signal.get('confidence')}\n"
             )
 
-        prompt = f"""
-═══════════════════════════════════════════════════════════════
-  {self.pair_label} FUTURES - {self.timeframe_label.upper()} TIMEFRAME ANALYSIS
-═══════════════════════════════════════════════════════════════
+        # Position health context for scalp-aware decision making
+        position_health_text = self._format_position_health(current_position)
 
-【MARKET CONTEXT - REAL-TIME DATA】
-
-{kline_text}
-
-{technical_text}
-
-{microstructure_text}
-
-{sentiment_text}
-
-{signal_text}
-
-【CURRENT MARKET STATE】
-├─ Current Price: ${price_data['price']:,.2f}
-├─ Time: {price_data['timestamp']}
-├─ Period High: ${price_data.get('high', 0):,.2f}
-├─ Period Low: ${price_data.get('low', 0):,.2f}
-├─ Volume: {price_data.get('volume', 0):.2f} {self.base_asset}
-├─ Price Change: {price_data.get('price_change', 0):+.2f}%
-└─ Current Position: {position_text}
-
-【CRITICAL TECHNICAL STATUS】
-├─ Overall Trend: {technical_data.get('overall_trend', 'N/A')}
-├─ Short-term Trend: {technical_data.get('short_term_trend', 'N/A')}
-├─ RSI: {technical_data.get('rsi', 0):.1f} ({'🔴 Overbought' if technical_data.get('rsi', 0) > 70 else '🟢 Oversold' if technical_data.get('rsi', 0) < 30 else '⚪ Neutral'})
-└─ MACD Direction: {technical_data.get('macd_trend', 'N/A')}
-
-═══════════════════════════════════════════════════════════════
-  TRADING STRATEGY FRAMEWORK - MUST FOLLOW
-═══════════════════════════════════════════════════════════════
-
-【1. DECISION HIERARCHY (Weight Distribution)】
-
-Primary Layer (50% weight) - TECHNICAL ANALYSIS:
-├─ Trend Direction (MA alignment, price action)
-│  ├─ Strong uptrend: Price > SMA5 > SMA20 > SMA50 → BUY bias
-│  ├─ Strong downtrend: Price < SMA5 < SMA20 < SMA50 → SELL bias
-│  └─ Mixed/consolidation: No clear trend → HOLD/Cautious
-├─ Support/Resistance Levels
-│  ├─ Price near resistance with volume → Potential reversal SELL
-│  ├─ Price near support with volume → Potential bounce BUY
-│  └─ Price breaking key levels with volume → Strong signal
-└─ K-line Patterns & Candlestick Formations
-   ├─ Bullish patterns (hammer, engulfing, etc.) → BUY signal
-   ├─ Bearish patterns (shooting star, dark cloud, etc.) → SELL signal
-   └─ Doji/indecision → Wait for confirmation
-
-Secondary Layer (15% weight) - ORDER BOOK MICROSTRUCTURE:
-├─ Spread / spread-volatility: tighter and stable spreads improve execution confidence
-├─ TOB/depth imbalance + queue pressure: directional order book skew confirms bias
-├─ OFI and trade-flow imbalance: net aggressive flow should align with signal direction
-├─ VWAP deviation + sweep counts: detect exhaustion, absorption, or continuation bursts
-└─ Depth regime (thin/normal/thick): thin books increase slippage risk and false breaks
-
-Tertiary Layer (25% weight) - MARKET SENTIMENT:
-├─ Sentiment aligns with technical → Enhance confidence by 1 level
-├─ Sentiment diverges from technical → Follow technical, sentiment as warning
-└─ Sentiment data unavailable/delayed → Ignore, focus on technical
-
-Quaternary Layer (10% weight) - RISK MANAGEMENT:
-├─ Current position P&L status
-├─ Stop-loss placement (should be 1-2% from entry)
-└─ Position sizing constraints
-
-【1B. MICROSTRUCTURE EXECUTION FILTERS (Quant Calibration)】
-├─ Directional agreement improves confidence:
-│  ├─ Bullish: tob/depth imbalance > 0, ema_ofi > 0, trade_flow_imbalance > 0
-│  └─ Bearish: tob/depth imbalance < 0, ema_ofi < 0, trade_flow_imbalance < 0
-├─ Friction penalty:
-│  └─ If spread widens, spread_volatility rises, or depth_regime is thin, reduce confidence by one level
-└─ Conflict handling:
-   └─ If technical bias and microstructure bias strongly disagree, prefer HOLD unless a clear breakout is confirmed by volume
-
-【2. SIGNAL GENERATION LOGIC - STRICT RULES】
-
-BUY Signal Conditions (Require at least 2 of 3):
-├─ ✅ Strong uptrend confirmed by MA alignment
-├─ ✅ Price breaks above resistance with volume surge
-├─ ✅ RSI recovering from oversold (< 40) or healthy momentum (40-60)
-├─ ✅ MACD bullish crossover or positive histogram
-├─ ✅ Bullish K-line pattern (hammer, bullish engulfing, etc.)
-└─ ✅ Sentiment positive (if available, adds confidence)
-
-SELL Signal Conditions (Require at least 2 of 3):
-├─ ✅ Strong downtrend confirmed by MA alignment
-├─ ✅ Price breaks below support with volume surge
-├─ ✅ RSI declining from overbought (> 60) or strong bearish momentum
-├─ ✅ MACD bearish crossover or negative histogram
-├─ ✅ Bearish K-line pattern (shooting star, bearish engulfing, etc.)
-└─ ✅ Sentiment negative (if available, adds confidence)
-
-HOLD Signal Conditions:
-├─ ⚠️ Consolidation/narrow range trading (no clear direction)
-├─ ⚠️ Mixed signals (some indicators bullish, some bearish)
-├─ ⚠️ Waiting for confirmation (potential reversal but not confirmed)
-└─ ⚠️ Low volume with indecisive candles
-
-【3. CONFIDENCE LEVEL ASSIGNMENT】
-
-HIGH Confidence:
-├─ 3+ technical indicators align
-├─ Clear trend with strong volume
-├─ Price action confirms indicator signals
-└─ Sentiment supports (if available)
-
-MEDIUM Confidence:
-├─ 2 technical indicators align
-├─ Moderate trend strength
-├─ Some conflicting signals present
-└─ Sentiment neutral or unavailable
-
-LOW Confidence:
-├─ Only 1 strong indicator
-├─ Mixed signals predominant
-├─ Low volume/consolidation phase
-└─ Sentiment contradicts technical
-
-【4. ANTI-OVERTRADING PRINCIPLES】
-
-1. Trend Continuity:
-   └─ Don't reverse signal based on single candle fluctuation
-   └─ Require 2-3 consecutive bars confirming reversal
-
-2. Position Stability:
-   └─ Maintain direction unless clear reversal pattern
-   └─ Avoid frequent position changes (minimize transaction costs)
-
-3. Signal Confirmation:
-   └─ Wait for confirmation when in doubt
-   └─ Better to HOLD than make wrong move
-
-4. Volume Validation:
-   └─ High-confidence signals require volume confirmation
-   └─ Low volume moves are less reliable
-
-【5. {self.timeframe_label.upper()} TIMEFRAME SPECIFIC CONSIDERATIONS】
-
-├─ Prioritize setups consistent with this timeframe's trend structure
-├─ Confirm breakouts with both volume and microstructure alignment
-├─ RSI extremes indicate momentum but require context from structure and liquidity
-├─ MACD crossovers matter more when supported by price action
-└─ In low-volume consolidation, HOLD is preferred over forced entries
-
-【6. RISK MANAGEMENT INTEGRATION】
-
-Stop-Loss Placement:
-├─ BUY signal: Place 1-2% below entry or below recent support
-├─ SELL signal: Place 1-2% above entry or above recent resistance
-└─ Consider volatility: Tighter stops in volatile conditions
-
-Take-Profit Targets:
-├─ High confidence: 2-3% target
-├─ Medium confidence: 1.5-2% target
-└─ Low confidence: 1% target or consider HOLD
-
-Position Management:
-├─ Existing LONG position:
-│  ├─ Trend continues → Maintain BUY signal
-│  ├─ Trend reverses → Generate SELL signal to close/reverse
-│  └─ Unrealized loss > 2% → Consider cutting losses
-└─ Existing SHORT position:
-   ├─ Trend continues → Maintain SELL signal
-   ├─ Trend reverses → Generate BUY signal to close/reverse
-   └─ Unrealized loss > 2% → Consider cutting losses
-
-═══════════════════════════════════════════════════════════════
-  OUTPUT REQUIREMENTS
-═══════════════════════════════════════════════════════════════
-
-Provide a comprehensive analysis and trading signal.
-
-CRITICAL: Your response MUST be valid JSON only, no additional text.
-
-**IMPORTANT JSON FORMATTING RULES:**
-1. DO NOT use double quotes (") inside string values
-2. Use single quotes (') or parentheses for emphasis instead
-3. The "reason" field must be a single continuous string without internal quotes
-
-JSON Format:
-{{
-    "signal": "BUY|SELL|HOLD",
-    "confidence": "HIGH|MEDIUM|LOW",
-    "reason": "Detailed analysis including: (1) Current trend assessment, (2) Key technical indicators analysis, (3) Support/resistance levels, (4) Volume analysis, (5) Risk factors, (6) Why this signal at this moment. Use ONLY single quotes or parentheses for emphasis, NEVER use double quotes inside this field.",
-    "stop_loss": <numerical_price_value>,
-    "take_profit": <numerical_price_value>,
-    "trend_strength": "STRONG|MODERATE|WEAK",
-    "risk_assessment": "LOW|MEDIUM|HIGH"
-}}
-
-Example stop_loss/take_profit values:
-- BUY: stop_loss should be current_price * 0.98-0.99, take_profit should be current_price * 1.02-1.03
-- SELL: stop_loss should be current_price * 1.01-1.02, take_profit should be current_price * 0.97-0.98
-- HOLD: Set stop_loss and take_profit to current_price
-
-Example CORRECT reason format:
-"reason": "(1) Current trend shows strong downward momentum with price below all SMAs. (2) RSI at 35 indicates oversold conditions. (3) Key support at $110,000 being tested. Use single quotes for 'emphasis' if needed."
-
-Example WRONG reason format (DO NOT USE):
-"reason": "(1) Current trend "assessment" shows..." <- WRONG! Contains internal double quotes
-
-Remember: Be decisive but not reckless. Quality over quantity.
-"""
+        prompt = (
+            f"{self.pair_label} | {self.timeframe_label} | SCALP ANALYSIS — output JSON only.\n\n"
+            f"{kline_text}\n"
+            f"{technical_text}\n"
+            f"{microstructure_text}\n"
+            f"{sentiment_text}\n"
+            f"{risk_context_text}\n"
+            f"{position_health_text}\n"
+            f"{signal_text}\n"
+            "CURRENT\n"
+            f"price={price_data['price']:.4f} time={price_data['timestamp']} "
+            f"h={price_data.get('high', 0):.4f} l={price_data.get('low', 0):.4f} "
+            f"vol={price_data.get('volume', 0):.4f} chg_pct={price_data.get('price_change', 0):+.4f}% "
+            f"position={position_text}\n"
+            "HEADLINE TECH\n"
+            f"trend={technical_data.get('overall_trend')} st={technical_data.get('short_term_trend')} "
+            f"rsi={technical_data.get('rsi', 0):.1f} macd_side={technical_data.get('macd_trend')}\n\n"
+            "DECISION FRAMEWORK (scalp):\n"
+            "- If holding a profitable position: strongly consider TAKING PROFIT (signal opposite to close).\n"
+            "- If uPnL was higher before and is now declining (giveback): EXIT before it turns negative.\n"
+            "- If flat: only enter on strong directional evidence with volume confirmation.\n"
+            "- Scalp targets: 0.3-0.8% profit is a good trade. Do not hold for 2-3%.\n\n"
+            "Output: single JSON object in English, no markdown.\n"
+            'Schema (all string values except optional stop_loss/take_profit numbers):\n'
+            "{\n"
+            '  "signal": "BUY|SELL|HOLD",\n'
+            '  "confidence": "HIGH|MEDIUM|LOW",\n'
+            '  "regime": "short label",\n'
+            '  "thesis": "compact reasoning IN ENGLISH",\n'
+            '  "invalidation": "what would prove this wrong",\n'
+            '  "execution_note": "scaling/spread/friction-aware note",\n'
+            '  "volume_note": "volume context",\n'
+            '  "risk_assessment": "LOW|MEDIUM|HIGH",\n'
+            '  "trend_strength": "STRONG|MODERATE|WEAK"\n'
+            "}\n"
+            "BUY = go long / close short. SELL = go short / close long. HOLD = do nothing.\n"
+            "Optional: stop_loss, take_profit (numbers or omit).\n"
+            "HOLD is allowed when evidence conflicts; avoid inventing precise SL/TP.\n"
+        )
         return prompt
 
     def _format_kline_data(self, kline_data: list) -> str:
         """Format K-line data for prompt."""
         if not kline_data:
-            return "【Recent K-line Data】\nNo K-line data available"
+            return "KLINES none"
 
-        window = kline_data[-min(len(kline_data), 30):]
-        kline_text = f"【Recent {len(window)} {self.timeframe_label} K-lines (Most Recent)】\n"
-        for i, kline in enumerate(window, 1):
-            candle_type = "🟢 Bullish" if kline['close'] > kline['open'] else "🔴 Bearish"
-            change = ((kline['close'] - kline['open']) / kline['open']) * 100
-            body_size = abs(kline['close'] - kline['open'])
-            total_range = kline['high'] - kline['low']
-            body_ratio = (body_size / total_range * 100) if total_range > 0 else 0
-            
-            kline_text += (
-                f"K{i}: {candle_type} | "
-                f"O:{kline['open']:.2f} H:{kline['high']:.2f} L:{kline['low']:.2f} C:{kline['close']:.2f} | "
-                f"Change:{change:+.2f}% | "
-                f"Vol:{kline['volume']:.2f} | "
-                f"Body:{body_ratio:.1f}%\n"
+        window = kline_data[-min(len(kline_data), 20):]
+        lines = [f"KLINES ({len(window)} bars, OHLCV):"]
+        for i, k in enumerate(window, 1):
+            lines.append(
+                f"{i}: o={k['open']:.4f} h={k['high']:.4f} l={k['low']:.4f} "
+                f"c={k['close']:.4f} v={k['volume']:.4f}"
             )
-        return kline_text
+        return "\n".join(lines)
 
     def _has_microstructure_features(self, micro_data: Optional[Dict[str, Any]]) -> bool:
         """Return True when at least one target microstructure field is present."""
         if not isinstance(micro_data, dict):
             return False
+        if isinstance(micro_data.get("tf_windows"), dict) and micro_data["tf_windows"].get("ready"):
+            return True
         fields = (
             "spread_bps",
             "spread_volatility",
@@ -684,10 +688,7 @@ Remember: Be decisive but not reckless. Quality over quantity.
     def _format_microstructure_data(self, micro_data: Optional[Dict[str, Any]]) -> str:
         """Format order book microstructure section for analysis prompt."""
         if not self._has_microstructure_features(micro_data):
-            return (
-                "【Order Book Microstructure (15% weight)】\n"
-                "Data unavailable this cycle; do not infer microstructure bias from missing fields."
-            )
+            return "MICRO none"
 
         micro = micro_data or {}
         def _f(key: str, default: float = 0.0) -> float:
@@ -705,35 +706,63 @@ Remember: Be decisive but not reckless. Quality over quantity.
                 return default
 
         lines = [
-            "【Order Book Microstructure (15% weight)】",
+            "MICRO",
             (
-                "├─ Spread: "
-                f"{_f('spread_bps'):.2f} bps | "
-                f"Spread Volatility: {_f('spread_volatility'):.4f}"
+                f"spread_bps={_f('spread_bps'):.2f} spread_vol={_f('spread_volatility'):.4f} "
+                f"tob_imb={_f('tob_imbalance'):+.4f} depth_imb={_f('depth_imbalance'):+.4f}"
             ),
             (
-                "├─ TOB Imbalance: "
-                f"{_f('tob_imbalance'):+.4f} | "
-                f"Depth Imbalance: {_f('depth_imbalance'):+.4f}"
+                f"ema_ofi={_f('ema_ofi'):+.5f} queue_p={_f('queue_pressure'):+.4f} "
+                f"tfi={_f('trade_flow_imbalance'):+.4f} vwap_dev_bps={_f('vwap_deviation_bps'):+.2f}"
             ),
-            (
-                "├─ EMA OFI: "
-                f"{_f('ema_ofi'):+.5f} | "
-                f"Queue Pressure: {_f('queue_pressure'):+.4f}"
-            ),
-            (
-                "├─ Trade Flow Imbalance: "
-                f"{_f('trade_flow_imbalance'):+.4f} | "
-                f"VWAP Deviation: {_f('vwap_deviation_bps'):+.2f} bps"
-            ),
-            (
-                "├─ Sweep Counts: "
-                f"Buy {_i('sweep_buy_count')} | "
-                f"Sell {_i('sweep_sell_count')}"
-            ),
-            f"└─ Depth Regime: {micro.get('depth_regime', 'unknown')}",
+            f"sweep buy/sell={_i('sweep_buy_count')}/{_i('sweep_sell_count')} depth_regime={micro.get('depth_regime', '?')}",
         ]
+        tw = micro.get("tf_windows")
+        if isinstance(tw, dict) and tw.get("ready"):
+            lines.append("")
+            lines.append("MICRO_TF")
+            for key, pretty in (
+                ("fast", "FAST_60s"),
+                ("main", "MAIN_TF"),
+                ("context", "CONTEXT_3X_TF"),
+            ):
+                lines.append(self._summarize_tf_ob_window(pretty, tw.get(key)))
+
         return "\n".join(lines)
+
+    @staticmethod
+    def _summarize_tf_ob_window(title: str, node: Any) -> str:
+        """Render one window bucket for prompting."""
+
+        def _nf(val: Any) -> str:
+            try:
+                if val is None:
+                    return "na"
+                return f"{float(val):.3f}"
+            except (TypeError, ValueError):
+                return "na"
+
+        if not isinstance(node, dict) or not node.get("ready"):
+            return (
+                f"├─ {title}: sparse snapshots "
+                f"(n={node.get('n_snapshots') if isinstance(node, dict) else '0'})"
+            )
+        labels = node.get("labels") or {}
+        regimes = node.get("depth_regime_proportions") or {}
+        reg_txt = ",".join(f"{k}:{v}" for k, v in list(regimes.items())[:4])
+        return (
+            f"├─ {title}: "
+            f"spread_mu/p95/sig {_nf(node.get('spread_mean_bps'))}/"
+            f"{_nf(node.get('spread_p95_bps'))}/{_nf(node.get('spread_vol'))} | "
+            f"norm_OFI {_nf(node.get('normalized_ofi_score'))} | "
+            f"tfi {_nf(node.get('trade_flow_imbalance'))} | "
+            f"sweep_imb {_nf(node.get('sweep_imbalance'))} | "
+            f"µpx_mid_bps {_nf(node.get('microprice_vs_mid_bps_avg'))} || "
+            f"L:{labels.get('liquidity')} F:{labels.get('friction')} "
+            f"P:{labels.get('directional_pressure')} A:{labels.get('absorption')} "
+            f"RS:{labels.get('regime_shift')}"
+            f"{(' | regimes ' + reg_txt) if reg_txt else ''}"
+        )
 
     def _format_technical_data(self, technical_data: Dict[str, Any]) -> str:
         """Format technical indicator data for prompt."""
@@ -741,65 +770,52 @@ Remember: Be decisive but not reckless. Quality over quantity.
         def safe_float(val, default=0):
             return float(val) if val is not None else default
 
-        text = f"""
-【Technical Indicator Analysis】
-📈 Moving Averages (SMA):
-{self._format_sma_data(technical_data)}
+        rsi = safe_float(technical_data.get('rsi'))
+        atr = safe_float(technical_data.get('atr'))
+        atr_pct = safe_float(technical_data.get('atr_pct'))
+        ddx = safe_float(technical_data.get('dmi_dx'))
+        adx = safe_float(technical_data.get('adx'))
 
-🎯 Trend Analysis:
-├─ Short-term: {technical_data.get('short_term_trend', 'N/A')}
-├─ Medium-term: {technical_data.get('medium_term_trend', 'N/A')}
-├─ Overall: {technical_data.get('overall_trend', 'N/A')}
-└─ MACD Direction: {technical_data.get('macd_trend', 'N/A')}
-
-📊 Momentum Indicators:
-├─ RSI: {safe_float(technical_data.get('rsi')):.2f} ({'🔴 Overbought (>70)' if safe_float(technical_data.get('rsi')) > 70 else '🟢 Oversold (<30)' if safe_float(technical_data.get('rsi')) < 30 else '⚪ Neutral (30-70)'})
-├─ MACD Line: {safe_float(technical_data.get('macd')):.4f}
-├─ Signal Line: {safe_float(technical_data.get('macd_signal')):.4f}
-└─ Histogram: {safe_float(technical_data.get('macd_histogram')):.4f} {'🟢 Bullish' if safe_float(technical_data.get('macd_histogram')) > 0 else '🔴 Bearish'}
-
-🎚️ Bollinger Bands:
-├─ Upper Band: {safe_float(technical_data.get('bb_upper')):.2f}
-├─ Middle Band (SMA): {safe_float(technical_data.get('bb_middle')):.2f}
-├─ Lower Band: {safe_float(technical_data.get('bb_lower')):.2f}
-└─ Price Position: {safe_float(technical_data.get('bb_position')):.2%} ({'🔴 Near Upper (>80%)' if safe_float(technical_data.get('bb_position')) > 0.8 else '🟢 Near Lower (<20%)' if safe_float(technical_data.get('bb_position')) < 0.2 else '⚪ Middle Zone (20-80%)'})
-
-💰 Key Levels:
-├─ Resistance: ${safe_float(technical_data.get('resistance')):.2f}
-└─ Support: ${safe_float(technical_data.get('support')):.2f}
-
-📦 Volume Analysis:
-└─ Volume Ratio: {safe_float(technical_data.get('volume_ratio')):.2f}x average ({'🟢 High Volume' if safe_float(technical_data.get('volume_ratio')) > 1.5 else '🔴 Low Volume' if safe_float(technical_data.get('volume_ratio')) < 0.5 else '⚪ Normal'})
-"""
+        text = (
+            "TECH "
+            f"st/mt/overall={technical_data.get('short_term_trend')}/{technical_data.get('medium_term_trend')}/"
+            f"{technical_data.get('overall_trend')} macd_trend={technical_data.get('macd_trend')} "
+            f"rsi={rsi:.1f} macd_hist={safe_float(technical_data.get('macd_histogram')):.5f}\n"
+            f"bb u/m/l={safe_float(technical_data.get('bb_upper')):.4f}/{safe_float(technical_data.get('bb_middle')):.4f}/"
+            f"{safe_float(technical_data.get('bb_lower')):.4f} bb_pos={safe_float(technical_data.get('bb_position')):.3f}\n"
+            f"atr={atr:.6f} atr_pct={atr_pct:.4f} adx={adx:.2f} dmi_dx={ddx:.2f} "
+            f"dmi+/-={safe_float(technical_data.get('dmi_pos')):.4f}/{safe_float(technical_data.get('dmi_neg')):.4f}\n"
+            f"SMA: {self._format_sma_data(technical_data).replace(chr(10), ' ')} "
+            f"levels R/S={safe_float(technical_data.get('resistance')):.4f}/{safe_float(technical_data.get('support')):.4f}\n"
+            f"VOL rvol={safe_float(technical_data.get('rvol', technical_data.get('volume_ratio'))):.3f} "
+            f"z={safe_float(technical_data.get('volume_zscore')):.2f} slope={safe_float(technical_data.get('volume_trend_slope')):.6f} "
+            f"dir_conf={technical_data.get('directional_volume_confirmation')} regime={technical_data.get('volume_regime')}"
+        )
         return text
     
     def _format_sma_data(self, technical_data: Dict[str, Any]) -> str:
         """Format SMA data dynamically based on available periods."""
-        sma_text = ""
-        sma_keys = [key for key in technical_data.keys() if key.startswith('sma_')]
-        
-        if sma_keys:
-            for key in sorted(sma_keys, key=lambda x: int(x.split('_')[1])):
-                period = key.split('_')[1]
-                value = technical_data[key]
-                sma_text += f"├─ SMA {period}: ${float(value):,.2f}\n"
-            sma_text = sma_text.rstrip('\n')
-        else:
-            sma_text = "├─ SMA data not available"
-        
-        return sma_text
+        sma_keys = sorted(
+            [key for key in technical_data.keys() if key.startswith('sma_')],
+            key=lambda x: int(x.split('_')[1]),
+        )
+        if not sma_keys:
+            return "none"
+        return " ".join(
+            f"SMA{k.split('_')[1]}={float(technical_data[k]):.4f}"
+            for k in sma_keys
+        )
 
     def _format_sentiment_data(self, sentiment_data: Optional[Dict[str, Any]]) -> str:
         """Format sentiment data for prompt."""
         if not sentiment_data:
-            return "【Market Sentiment】Data not available"
+            return "SENT n/a"
 
         sign = '+' if sentiment_data['net_sentiment'] >= 0 else ''
         return (
-            f"【Market Sentiment】"
-            f"Bullish {sentiment_data['positive_ratio']:.1%} | "
-            f"Bearish {sentiment_data['negative_ratio']:.1%} | "
-            f"Net {sign}{sentiment_data['net_sentiment']:.3f}"
+            "SENT "
+            f"+/- {sentiment_data['positive_ratio']:.1%}/{sentiment_data['negative_ratio']:.1%} "
+            f"net {sign}{sentiment_data['net_sentiment']:.3f}"
         )
 
     def _format_position_data(self, position: Optional[Dict[str, Any]]) -> str:
@@ -813,6 +829,87 @@ Remember: Be decisive but not reckless. Quality over quantity.
             f"Avg Price: ${position.get('avg_px', 0):.2f}, "
             f"P&L: {position.get('unrealized_pnl', 0):.2f} {self.quote_asset}"
         )
+
+    def _format_position_health(self, position: Optional[Dict[str, Any]]) -> str:
+        """Format position health/trajectory context for scalp-aware prompting."""
+        if not position:
+            return "POS_HEALTH flat"
+
+        health = position.get("position_health") or {}
+        if not health:
+            return "POS_HEALTH n/a"
+
+        profit_pct = health.get("profit_pct", 0)
+        peak_profit_pct = health.get("peak_profit_pct", 0)
+        giveback_pct = health.get("giveback_pct", 0)
+        bars_held = health.get("bars_held", 0)
+        recommendation = health.get("recommendation", "")
+
+        lines = [
+            "POS_HEALTH",
+            f"current_profit_pct={profit_pct:+.3f}% peak_profit_pct={peak_profit_pct:+.3f}%",
+            f"giveback_from_peak={giveback_pct:.1f}% bars_held={bars_held}",
+        ]
+        if recommendation:
+            lines.append(f"health_signal={recommendation}")
+        if giveback_pct > 40:
+            lines.append("⚠ GIVE-BACK >40%: strongly consider exiting to lock in remaining profit")
+        elif peak_profit_pct > 0.2 and profit_pct < 0.05:
+            lines.append("⚠ PROFIT EVAPORATING: peak was significant, now near breakeven")
+
+        return "\n".join(lines)
+
+    def _format_risk_context_data(self, risk_context: Optional[Dict[str, Any]]) -> str:
+        """Format account, open-order, and recent realized P&L context."""
+        if not risk_context:
+            return "RISK n/a"
+
+        compact = self._compact_risk_context(risk_context) or {}
+        wallet = compact.get("wallet") or {}
+        exchange_position = compact.get("exchange_position") or {}
+        trade_summary = compact.get("recent_trade_summary") or {}
+        open_orders = compact.get("open_orders") or []
+        errors = risk_context.get("errors") or []
+
+        lines = [
+            "RISK",
+            (
+                f"wallet eq={wallet.get('total_equity')} avail={wallet.get('total_available_balance')} "
+                f"init_m={wallet.get('total_initial_margin')} maint_m={wallet.get('total_maintenance_margin')}"
+            ),
+        ]
+
+        if exchange_position:
+            lines.append(
+                f"ex_pos {exchange_position.get('side')} {exchange_position.get('quantity')} "
+                f"@ {exchange_position.get('avg_price')} notional={exchange_position.get('position_value')} "
+                f"upnl={exchange_position.get('unrealized_pnl')} liq={exchange_position.get('liq_price')}"
+            )
+        else:
+            lines.append("ex_pos flat")
+
+        oo_n = compact.get('open_orders_count', 0)
+        lines.append(f"open_orders={oo_n}")
+        for order in open_orders[:5]:
+            lines.append(
+                f"  ord {order.get('side')} {order.get('quantity')} {order.get('order_type')} "
+                f"st={order.get('status')} ro={order.get('reduce_only')} px={order.get('price')}"
+            )
+
+        lines.append(
+            "closed_5 "
+            f"n={trade_summary.get('last_5_count')} W/L={trade_summary.get('last_5_wins')}/"
+            f"{trade_summary.get('last_5_losses')} pnl={trade_summary.get('last_5_realized_pnl')}"
+        )
+        for trade in (trade_summary.get("last_5_outcomes") or [])[:5]:
+            lines.append(
+                f"  tr {trade.get('outcome')} {trade.get('side')} {trade.get('quantity')} "
+                f"pnl={trade.get('closed_pnl')}"
+            )
+
+        if errors:
+            lines.append(f"warn fetch_errors={len(errors)}")
+        return "\n".join(lines)
 
     def _safe_parse_json(self, json_str: str) -> Optional[Dict[str, Any]]:
         """Safely parse JSON response, handling format issues."""
@@ -867,14 +964,36 @@ Remember: Be decisive but not reckless. Quality over quantity.
 
             return None
 
+    def _emit_fallback(self, price_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Build fallback signal and run legacy SL/TP bridging for downstream consumers."""
+        fb = self._create_fallback_signal(price_data)
+        self._finalize_signal_compat(fb, price_data)
+        fb["is_fallback"] = True
+        return fb
+
     def _create_fallback_signal(self, price_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create conservative fallback signal when AI analysis fails."""
+        px_raw = price_data.get("price")
+        try:
+            px = float(px_raw) if px_raw is not None else 0.0
+        except (TypeError, ValueError):
+            px = 0.0
+        thesis = "Conservative fallback: model output unavailable or failed validation."
         return {
             "signal": "HOLD",
-            "reason": "Conservative strategy due to technical analysis unavailable",
-            "stop_loss": price_data['price'] * 0.98,  # -2%
-            "take_profit": price_data['price'] * 1.02,  # +2%
+            "reason": thesis,
+            "thesis": thesis,
+            "regime": "unknown",
+            "invalidation": "n/a",
+            "execution_note": "No new risk until model output is restored.",
+            "volume_note": "n/a",
+            "risk_assessment": "HIGH",
+            "stop_loss": round(px, 10) if px else 0.0,
+            "take_profit": round(px, 10) if px else 0.0,
+            "trend_strength": "WEAK",
             "confidence": "LOW",
+            "reasoning_content": "fallback_default_no_model_output",
+            "llm_model": self.model,
             "is_fallback": True,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
@@ -887,8 +1006,13 @@ Remember: Be decisive but not reckless. Quality over quantity.
 
         self._log_debug(f"📊 Signal Stats: {signal} (appeared {signal_count}/{total} times in recent history)")
 
-        # Check for consecutive same signals
+        # Check for consecutive same signals (only warn on 3rd and every 5th after)
         if len(self.signal_history) >= 3:
-            last_three = [s['signal'] for s in self.signal_history[-3:]]
-            if len(set(last_three)) == 1:
-                self._log_warning(f"⚠️ Warning: 3 consecutive {signal} signals")
+            consecutive = 0
+            for s in reversed(self.signal_history):
+                if s.get('signal') == signal:
+                    consecutive += 1
+                else:
+                    break
+            if consecutive == 3 or (consecutive > 3 and consecutive % 5 == 0):
+                self._log_warning(f"⚠️ {consecutive} consecutive {signal} signals")
