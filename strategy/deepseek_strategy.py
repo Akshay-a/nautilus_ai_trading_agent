@@ -223,6 +223,7 @@ class DeepSeekAIStrategy(Strategy):
             "entry_bar_count": 0,
             "entry_price": 0.0,
             "entry_side": None,
+            "entry_key": None,
         }
 
         # Technical indicators manager
@@ -1323,6 +1324,24 @@ class DeepSeekAIStrategy(Strategy):
             'source': 'nautilus_aggregate',
         }
 
+    @staticmethod
+    def _position_identity_key(position_data: Dict[str, Any]) -> Any:
+        """
+        Stable identity for the currently open position/trade.
+
+        Used to decide when peak-uPnL tracking must be reset. Nautilus assigns a
+        fresh position id on every new trade, so a re-entry on the same side still
+        produces a distinct key. When ids are unavailable (e.g. exchange-context
+        fallback), fall back to (side, rounded entry price) which still changes on
+        a genuine re-entry.
+        """
+        position_ids = position_data.get("position_ids") or []
+        if position_ids:
+            return tuple(sorted(str(pid) for pid in position_ids))
+        side = position_data.get("side")
+        avg_px = round(float(position_data.get("avg_px", 0.0)), 6)
+        return (side, avg_px)
+
     def _enrich_position_health(self, position_data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """
         Add position health metrics for scalp-aware LLM prompting.
@@ -1337,20 +1356,26 @@ class DeepSeekAIStrategy(Strategy):
                 "entry_bar_count": 0,
                 "entry_price": 0.0,
                 "entry_side": None,
+                "entry_key": None,
             }
             return None
 
         upnl = float(position_data.get("unrealized_pnl", 0.0))
         notional = float(position_data.get("notional_usdt", 0.0))
         current_side = position_data.get("side")
+        current_key = self._position_identity_key(position_data)
 
-        if self._position_health.get("entry_side") != current_side:
+        # Reset peak tracking whenever this is a *different* open position than the
+        # one we were tracking. A fresh re-entry (even on the same side) gets a new
+        # Nautilus position id, so the prior trade's peak uPnL must not carry over.
+        if self._position_health.get("entry_key") != current_key:
             self._position_health = {
                 "peak_unrealized_pnl": upnl,
                 "peak_profit_pct": 0.0,
                 "entry_bar_count": self.bars_received,
                 "entry_price": float(position_data.get("avg_px", 0.0)),
                 "entry_side": current_side,
+                "entry_key": current_key,
             }
 
         if upnl > self._position_health["peak_unrealized_pnl"]:
@@ -1441,6 +1466,15 @@ class DeepSeekAIStrategy(Strategy):
 
         exchange_position = risk_context.get("position")
         if not exchange_position:
+            if current_position and risk_context.get("ok"):
+                open_orders = risk_context.get("open_orders") or []
+                if not open_orders:
+                    self.log.warning(
+                        "⚠️ Nautilus cache reports an open position but Bybit is flat "
+                        f"(nautilus={current_position.get('side')} {current_position.get('quantity')} {self.base_asset}, "
+                        "bybit=flat); using Bybit flat state for this cycle"
+                    )
+                    return None
             return current_position
 
         exchange_as_position = self._position_from_exchange_context(
@@ -1527,6 +1561,13 @@ class DeepSeekAIStrategy(Strategy):
                 "note": f"confidence_below_min:{confidence}<{self.min_confidence}",
             }
 
+        partial_execution = self._apply_partial_close_from_signal(
+            signal_data=signal_data,
+            current_position=current_position,
+        )
+        if partial_execution is not None:
+            return partial_execution
+
         # Handle HOLD signal
         if signal == 'HOLD':
             self.log.info("📊 Signal: HOLD - No action taken")
@@ -1565,6 +1606,63 @@ class DeepSeekAIStrategy(Strategy):
                 "target_quantity": target_quantity,
                 "note": "order_logic_dispatched",
             }
+
+    def _apply_partial_close_from_signal(
+        self,
+        signal_data: Dict[str, Any],
+        current_position: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Execute partial position reduction when LLM provides partial_close_pct.
+
+        Works for both:
+        - HOLD + partial_close_pct (scale out while holding bias)
+        - Opposite bias + partial_close_pct (reduce existing exposure, avoid full reversal)
+        """
+        if not current_position:
+            return None
+
+        raw = signal_data.get("partial_close_pct")
+        if raw is None:
+            return None
+
+        try:
+            pct = float(raw)
+        except (TypeError, ValueError):
+            self.log.warning("⚠️ Ignoring invalid partial_close_pct from LLM")
+            return None
+
+        if pct <= 0:
+            return None
+        pct = min(1.0, pct)
+
+        current_qty = float(current_position.get("quantity") or 0.0)
+        if current_qty <= 0:
+            return None
+
+        reduce_qty = self._normalize_order_quantity(current_qty * pct)
+        if reduce_qty is None:
+            return {
+                "status": "skipped",
+                "action": "partial_close",
+                "note": "partial_close_qty_below_increment",
+            }
+
+        reduce_qty = min(reduce_qty, current_qty)
+        exit_side = (
+            OrderSide.SELL if current_position.get("side") == "long" else OrderSide.BUY
+        )
+        self._submit_order(side=exit_side, quantity=reduce_qty, reduce_only=True)
+        self.log.info(
+            f"✂️ Partial close from LLM: pct={pct:.2f}, qty={reduce_qty:.6g}/{current_qty:.6g} {self.base_asset}"
+        )
+        return {
+            "status": "submitted",
+            "action": "partial_close",
+            "target_side": current_position.get("side"),
+            "target_quantity": max(0.0, current_qty - reduce_qty),
+            "note": f"partial_close_pct:{pct:.4f}",
+        }
 
     def _calculate_position_size(
         self,

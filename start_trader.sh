@@ -22,6 +22,14 @@ export TIMER_INTERVAL_SEC=300
 
 mkdir -p logs
 
+existing_pids="$(pgrep -f "python.*main_live.py" || true)"
+if [ -n "$existing_pids" ]; then
+  echo "⚠️ Refusing to start: existing main_live.py process(es) detected:"
+  echo "$existing_pids"
+  echo "Use ./restart_trader.sh for a safe single-process restart."
+  exit 1
+fi
+
 nohup python main_live.py > "logs/trader_$(date +%Y%m%d_%H%M%S).log" 2>&1 &
 echo $! > trader.pid
 
