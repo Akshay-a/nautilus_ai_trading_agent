@@ -1,5 +1,61 @@
 # TODO
 
+## Plan (Prompt Autonomy Rebalance + External Research - 2026-05-29)
+- [x] Run focused external research on autonomous LLM trading policy design with cost/friction and regime dependence.
+- [x] Identify prompt-policy gaps versus current implementation (exit bias, threshold rigidity, win-rate trap risk).
+- [x] Update `utils/deepseek_client.py` prompt sections to remove hard-coded exit criteria and make hold/reduce/exit more autonomous and structure-led.
+- [x] Keep safety-critical constraints intact: Bybit source-of-truth and friction-awareness.
+- [x] Re-run targeted tests and compile checks.
+- [x] Document review notes and operator implications in this file.
+
+## Review (Prompt Autonomy Rebalance + External Research - 2026-05-29)
+- Research findings used:
+  - Live/autonomous LLM trading benchmarks emphasize regime dependence and tradeoff between strict guardrails vs guided autonomy (`arXiv:2605.06024`, `arXiv:2512.10971`).
+  - LLM agent behavior can follow trading styles when prompted with consistent instruction contracts (`arXiv:2504.10789`).
+  - Momentum evidence supports allowing continuation/hold behavior instead of forcing rapid exits (`JFE 2012 Time Series Momentum`).
+  - High-frequency alpha is highly execution-cost-sensitive, so friction remains a required anchor (`SSRN 1611623`, `SSRN 1678758`).
+  - Bybit fee schedule confirms baseline taker-fee assumptions vary by tier but VIP0 perpetual taker remains 0.055% in the current help-center schedule (updated 2026-05-07).
+- Prompt-policy gaps fixed:
+  - Removed rigid exit-first hierarchy and fixed threshold wording from LLM prompt instructions.
+  - Replaced with thesis-state workflow (`intact / weakening / invalidated`) and net-edge-after-friction framing.
+  - Explicitly encouraged holding winners when structure remains supportive and using partial reductions before full exits.
+- Safety constraints preserved:
+  - Exchange position/order truth precedence retained (`BYBIT EXCHANGE POSITION/OPEN_ORDERS IS THE SOURCE OF TRUTH`).
+  - Friction line and net edge language retained to avoid gross-positive/net-negative churn exits.
+- Verification:
+  - `python3 -m py_compile utils/deepseek_client.py` passed.
+  - `python3 -m pytest tests/test_strategy_components.py -q` passed (`9 passed`).
+
+## Plan (24h Log Forensics + Minimal Safety Fixes - 2026-05-29)
+- [x] Complete 24-hour log taxonomy with event signatures, frequencies, and code-source mapping.
+- [x] Reconstruct high-impact LLM decision chains (entry/exit/reject/mismatch/error windows) with timestamped evidence.
+- [x] Cross-check `log_dashboard.py` filters against observed taxonomy and implement minimal missing trace filters.
+- [x] Implement smallest safe state-awareness fix so Bybit flat state is treated as source-of-truth for decision context when local cache is stale.
+- [x] Apply compact prompt improvement to reduce naive percentage exits by explicitly considering fees/spread/slippage and structure.
+- [x] Verify changes with compile/lint-safe checks and dashboard parse run on latest logs.
+- [x] Check active bot processes, report live vs demo mode, and provide safe restart/monitor commands.
+- [x] Write review summary in this file with evidence-backed outcomes and residual risks.
+
+## Review (24h Log Forensics + Minimal Safety Fixes - 2026-05-29)
+- 24h forensic scope: `9437` JSON log events across 5 files; dominant components were `DeepSeekAIStrategy`, `ExecClient-BYBIT`, `Portfolio`, `ExecEngine`.
+- Critical operational finding: two concurrent `main_live.py` processes were running (`PID 11522` and `PID 37618`), each writing separate `deepseek_trader_*.json` files with overlapping decision timestamps.
+- State-mismatch finding: in `deepseek_trader_2026-05-27_233004:698.json`, there were `130` paired cycles where `Current Position: short ...` coexisted with `Bybit Risk Context ... position=flat 0`, causing repeated reduce-only rejects (`155`x `110017`).
+- Decision-quality finding: multiple exits were triggered on tiny gains (e.g. `0.134%`) while realized PnL after fees could be negative (example close event at `2026-05-28T00:10:09Z` had `realized_return=0.00012` but `realized_pnl=-11.78 USDT`).
+- Reliability finding: `33` fallback decisions caused by repeated `APIConnectionError` retries (`66` failed attempts logged).
+- Implemented minimal changes:
+  - `strategy/deepseek_strategy.py`: Bybit-flat truth override in `_merge_exchange_position_context` when `risk_context.ok=true` and no open orders, preventing stale local-position decisioning.
+  - `utils/deepseek_client.py`: compact prompt rules now require friction-aware exits (fees/spread/slippage), discourage tiny-percentage-only exits, and reiterate exchange-state truth precedence.
+  - `log_dashboard.py`: upgraded parser to support JSON logs + text logs, default 24h window, added event taxonomy trace list with filter/search controls for LLM chain, position/order state, mismatches, rejections, and failures.
+  - `start_trader.sh`: single-process safety guard to prevent accidental dual `main_live.py` launches.
+- Verification:
+  - `python -m py_compile strategy/deepseek_strategy.py utils/deepseek_client.py log_dashboard.py` passed.
+  - `bash -n start_trader.sh restart_trader.sh stop_trader.sh` passed.
+  - `python log_dashboard.py logs/deepseek_trader_2026-05-27_233004:698.json 24` succeeded (`Events: 3115`, dashboard rendered).
+  - Performed runtime process cleanup and restart: stopped tracked PID, terminated stale orphan PID, then started one fresh process (`PID 28247`) in demo mode.
+- Residual risks:
+  - Old overlapping sessions already polluted historical logs; keep per-run analysis scoped to one active log file whenever possible.
+  - External API connectivity instability (`APIConnectionError`) remains environmental/provider-side and is not fully solved by this patch.
+
 ## Plan (TA Migration + 5m Cadence + Prompt Minimization - 2026-05-27)
 - [x] Audit current TechnicalIndicatorManager for remaining hand-rolled computations and identify Nautilus-native replacements.
 - [x] Delegate implementation via Cursor CLI: add ATR + ADX-style trend-strength features, switch remaining TA components to Nautilus indicators, keep TechnicalManager thin.
@@ -517,3 +573,66 @@
     - execution intent summary
 - Verification:
   - `python3 -m py_compile utils/deepseek_client.py utils/trade_journal.py strategy/deepseek_strategy.py` passed.
+
+## Plan (Scalp Profit-Taking + Prompt/Log Audit from Latest Session - 2026-05-27)
+- [x] Reconstruct the latest session directly from `logs/deepseek_trader_2026-05-27_002731:811.json` and validate trade-by-trade flow, including reversals, adds, and missed profit exits.
+- [x] Audit exact LLM payload quality (trend labels, volume/OB semantics, position context richness, language drift) and identify interpretation failure points.
+- [x] Implement deterministic scalp behavior guardrails in strategy execution (profit capture and retrace-aware add/hold controls) so outcomes are not prompt-only.
+- [x] Tighten LLM prompt contract for scalp posture (English-only, profit-protection hierarchy, exit-first when giveback grows) and reduce ambiguous instructions.
+- [x] Reduce noisy log payloads while preserving decision-audit value; ensure future 1-3h runs stay readable.
+- [x] Run compile + focused tests and provide a validated review with residual risk notes.
+
+## Review (Scalp Profit-Taking + Prompt/Log Audit from Latest Session - 2026-05-27)
+- Session reconstruction + payload audit from `logs/deepseek_trader_2026-05-27_002731:811.json` confirmed:
+  - trend labels were Chinese in that run (`强势上涨/强势下跌/震荡整理`) and no `position_health` context reached the model.
+  - model language drift occurred (4 signal reasons with CJK text).
+  - profitable positions were repeatedly held through giveback, and same-direction add attempts happened during retraces.
+- Implemented strategy guardrails in `strategy/deepseek_strategy.py`:
+  - added deterministic scalp profit guard config fields to `DeepSeekAIStrategyConfig`.
+  - replaced hardcoded giveback block with `_apply_scalp_profit_guard(...)` supporting:
+    - full exit on deep giveback,
+    - partial reduce on moderate giveback,
+    - audit journaling for guard-triggered actions.
+  - added no-add-on-retrace protection in `_manage_existing_position(...)`.
+  - added short same-direction re-entry cooldown guard after forced full exits.
+  - aligned `position_health.recommendation` thresholds to scalp guard settings.
+- Implemented prompt/log hardening in `utils/deepseek_client.py`:
+  - normalize legacy Chinese trend labels before prompt construction.
+  - reject non-English synthesis payloads and force retry/fallback path.
+  - reduce log noise: INFO now emits compact context summary; full payload moved to DEBUG.
+  - compact `previous_signal` in payload logs to avoid recursive reasoning-content bloat.
+  - tightened scalp prompt framing for exit-first behavior on >30% giveback.
+- Improved volume semantics in `indicators/technical_manager.py`:
+  - replaced `weak_volume_drift` with directional labels:
+    - `up_move_weak_volume`
+    - `down_move_weak_volume`
+- Verification:
+  - `python3 -m py_compile utils/deepseek_client.py strategy/deepseek_strategy.py indicators/technical_manager.py` passed.
+  - `pytest tests/test_strategy_components.py -q` passed (`8 passed`).
+
+## Plan (Scalp Logic Simplification After User Review - 2026-05-27)
+- [x] Remove deterministic scalp state-machine guardrails from strategy execution and keep only minimal emergency giveback protection.
+- [x] Remove re-entry cooldown and no-add hard blocks so position management authority remains with LLM signals.
+- [x] Simplify non-English handling to warning-only (no fallback/retry penalty) while keeping trend-label normalization.
+- [x] Restore prompt scalp target wording to `0.3-0.8%`.
+- [x] Update/adjust tests and re-run compile + focused test suite.
+- [x] Capture the correction pattern in `tasks/lessons.md`.
+
+## Review (Scalp Logic Simplification After User Review - 2026-05-27)
+- Removed deterministic override logic from [`strategy/deepseek_strategy.py`](/Users/akshayapsingi/Projects/nautilus_ai_trading_agent/strategy/deepseek_strategy.py):
+  - deleted extra scalp config knobs and runtime state for partial/full guardrails.
+  - deleted `_apply_scalp_profit_guard`, `_set_reentry_guard`, `_is_reentry_blocked`.
+  - removed no-add guard in `_manage_existing_position`.
+  - removed re-entry cooldown block in `_execute_trade`.
+  - retained the minimal emergency full giveback exit block (60% giveback with peak > $5).
+- Simplified non-English policy in [`utils/deepseek_client.py`](/Users/akshayapsingi/Projects/nautilus_ai_trading_agent/utils/deepseek_client.py):
+  - still normalizes incoming Chinese trend labels.
+  - now warns on non-English synthesis text and uses the signal as-is (no forced fallback/retry loop).
+  - kept compact payload summary at INFO and full payload at DEBUG.
+- Restored prompt scalp target range wording to `0.3-0.8%`.
+- Kept directional volume semantics update (`up_move_weak_volume` / `down_move_weak_volume`) in [`indicators/technical_manager.py`](/Users/akshayapsingi/Projects/nautilus_ai_trading_agent/indicators/technical_manager.py).
+- Updated test coverage:
+  - adjusted non-English behavior test to validate warning-only path in [`tests/test_strategy_components.py`](/Users/akshayapsingi/Projects/nautilus_ai_trading_agent/tests/test_strategy_components.py).
+- Verification:
+  - `python3 -m py_compile utils/deepseek_client.py strategy/deepseek_strategy.py indicators/technical_manager.py tests/test_strategy_components.py` passed.
+  - `pytest tests/test_strategy_components.py -q` passed (`8 passed`).
