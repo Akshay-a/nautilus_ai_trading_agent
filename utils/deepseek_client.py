@@ -21,6 +21,12 @@ class DeepSeekAnalyzer:
     and sentiment data to produce structured trading signals.
     """
 
+    # Friction assumptions (Bybit linear perps). Round-trip = entry + exit.
+    # Taker fee ~5.5 bps/side -> 11 bps round trip. Spread is added live from
+    # microstructure; a small slippage buffer covers market-order impact.
+    ROUND_TRIP_FEE_BPS = 11.0
+    SLIPPAGE_BUFFER_BPS = 2.0
+
     def __init__(
         self,
         api_key: str,
@@ -155,20 +161,94 @@ class DeepSeekAnalyzer:
             f"You are an aggressive intraday SCALP TRADER on {self.pair_label} perpetuals "
             f"({self.timeframe_label} bars, {self.venue}).\n\n"
             "CORE SCALP TRADING RULES — follow these strictly:\n"
-            "1. TAKE PROFITS QUICKLY. If the position is profitable, your default bias is EXIT or REDUCE. "
-            "A small realized gain is always better than a large unrealized gain that evaporates.\n"
-            "2. CUT LOSSES FAST. If the position moves against entry, lean toward EXIT.\n"
-            "3. NEVER add to a retracing position. If uPnL was higher before and is now declining, "
-            "do NOT signal the same direction — signal HOLD or EXIT.\n"
-            "4. GIVE-BACK RULE: If position has given back >40% of its peak unrealized profit, "
-            "signal EXIT (the opposite direction signal).\n"
-            "5. When FLAT and evidence is mixed or weak, prefer HOLD. Only enter with clear conviction.\n"
-            "6. After exiting, wait for a fresh setup. Do not immediately re-enter the same direction.\n\n"
+            "1. OPTIMIZE EXPECTED NET PNL, NOT WIN RATE. Do not chase many tiny wins that fail after fees/spread/slippage.\n"
+            "2. LET WINNERS RUN WHEN THESIS IS INTACT. If trend/flow/liquidity still support the trade, prefer HOLD or partial REDUCE over immediate full EXIT.\n"
+            "3. EXIT ON INVALIDATION, NOT ON A TINY PERCENTAGE ALONE. Use structure breaks, opposing flow, liquidity deterioration, and thesis failure.\n"
+            "4. CUT LOSSES FAST WHEN INVALIDATED. Do not average into retracing exposure.\n"
+            "5. AVOID CHURN. Do not flip direction without fresh structural evidence.\n"
+            "6. WHEN EDGE IS WEAK OR MIXED, HOLD (no forced trade).\n\n"
             "POSITION MANAGEMENT PRIORITY:\n"
-            "- Profitable position → evaluate EXIT first, then HOLD, then ADD (rare, only on strong continuation)\n"
-            "- Losing position → evaluate EXIT first, then HOLD (never ADD)\n"
-            "- No position → evaluate entry with clear directional evidence\n\n"
+            "- Profitable position → evaluate HOLD first, then REDUCE, then EXIT based on thesis quality and net edge\n"
+            "- Losing position → EXIT if thesis is invalidated; otherwise HOLD (never ADD)\n"
+            "- No position → enter only with clear directional + volume/liquidity alignment and net edge above friction\n\n"
+            "BYBIT EXCHANGE POSITION/OPEN_ORDERS IS THE SOURCE OF TRUTH for actual exposure state.\n\n"
             "Respond ONLY in English. Output a single JSON object. No markdown, no prose outside JSON."
+        )
+
+    @staticmethod
+    def _normalize_technical_labels(technical_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Normalize legacy/non-English trend labels for stable prompt semantics.
+        """
+        if not isinstance(technical_data, dict):
+            return technical_data
+
+        trend_map = {
+            "强势上涨": "strong_up",
+            "强势下跌": "strong_down",
+            "震荡整理": "mixed",
+            "上涨": "up",
+            "下跌": "down",
+        }
+        normalized = dict(technical_data)
+        for key in ("overall_trend", "short_term_trend", "medium_term_trend"):
+            value = normalized.get(key)
+            if isinstance(value, str):
+                normalized[key] = trend_map.get(value, value)
+        return normalized
+
+    @staticmethod
+    def _contains_cjk(text: str) -> bool:
+        """Return True when text contains CJK characters."""
+        return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+
+    def _signal_contains_non_english_content(self, signal_data: Dict[str, Any]) -> bool:
+        """Heuristic guard for non-English synthesis fields."""
+        for key in ("thesis", "reason", "regime", "invalidation", "execution_note", "volume_note"):
+            value = signal_data.get(key)
+            if isinstance(value, str) and self._contains_cjk(value):
+                return True
+        return False
+
+    @staticmethod
+    def _compact_previous_signal(previous: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Compact previous signal snapshot for payload logging."""
+        if not isinstance(previous, dict):
+            return None
+        keys = (
+            "signal",
+            "confidence",
+            "regime",
+            "trend_strength",
+            "risk_assessment",
+            "thesis",
+            "timestamp",
+        )
+        compact = {k: previous.get(k) for k in keys if k in previous}
+        thesis = compact.get("thesis")
+        if isinstance(thesis, str) and len(thesis) > 220:
+            compact["thesis"] = thesis[:220] + "..."
+        return compact
+
+    @staticmethod
+    def _format_payload_summary(payload: Dict[str, Any]) -> str:
+        """Compact one-line payload summary for INFO logs."""
+        tech = payload.get("technical") or {}
+        micro = payload.get("microstructure") or {}
+        pos = payload.get("position") or {}
+        side = pos.get("side") if isinstance(pos, dict) else None
+        qty = pos.get("quantity") if isinstance(pos, dict) else None
+        upnl = pos.get("unrealized_pnl") if isinstance(pos, dict) else None
+        return (
+            "🤖 LLM Context: "
+            f"px={payload.get('price')} "
+            f"pos={side or 'flat'} qty={qty if qty is not None else '-'} "
+            f"upnl={upnl if upnl is not None else '-'} "
+            f"trend={tech.get('overall_trend')} "
+            f"rsi={tech.get('rsi')} "
+            f"rvol={tech.get('rvol')} "
+            f"vol_regime={tech.get('volume_regime')} "
+            f"tfi={micro.get('trade_flow_imbalance')}"
         )
 
     def _log_info(self, msg: str):
@@ -233,6 +313,7 @@ class DeepSeekAnalyzer:
             }
         """
         self._refresh_context_from_price_data(price_data)
+        technical_data = self._normalize_technical_labels(technical_data)
 
         for attempt in range(self.max_retries):
             try:
@@ -241,6 +322,9 @@ class DeepSeekAnalyzer:
                 )
 
                 if signal and not signal.get("is_fallback", False):
+                    if self._signal_contains_non_english_content(signal):
+                        self._log_warning("⚠️ Non-English synthesis fields detected; using signal as-is.")
+                    self._record_signal(signal)
                     return signal
 
                 self._log_warning(f"⚠️ Attempt {attempt + 1} returned fallback, retrying...")
@@ -248,9 +332,13 @@ class DeepSeekAnalyzer:
             except Exception as e:
                 self._log_error(f"❌ Analysis attempt {attempt + 1} failed: {type(e).__name__}: {e}")
                 if attempt == self.max_retries - 1:
-                    return self._emit_fallback(price_data)
+                    fallback = self._emit_fallback(price_data)
+                    self._record_signal(fallback)
+                    return fallback
 
-        return self._emit_fallback(price_data)
+        fallback = self._emit_fallback(price_data)
+        self._record_signal(fallback)
+        return fallback
 
     def _finalize_signal_compat(self, signal_data: Dict[str, Any], price_data: Dict[str, Any]) -> None:
         """
@@ -324,9 +412,8 @@ class DeepSeekAnalyzer:
             current_position=current_position,
             risk_context=risk_context,
         )
-        self._log_info(
-            f"🤖 LLM Prompt Payload: {json.dumps(prompt_payload, ensure_ascii=False)}"
-        )
+        self._log_info(self._format_payload_summary(prompt_payload))
+        self._log_debug(f"🤖 LLM Prompt Payload: {json.dumps(prompt_payload, ensure_ascii=False)}")
         micro_included = self._has_microstructure_features(price_data.get("microstructure"))
         self._log_info(
             f"🤖 Prompt microstructure section included: {'true' if micro_included else 'false'}"
@@ -413,20 +500,31 @@ class DeepSeekAnalyzer:
 
         self._finalize_signal_compat(signal_data, price_data)
 
+        partial_close_raw = signal_data.get("partial_close_pct")
+        if partial_close_raw is not None:
+            try:
+                partial_close_val = float(partial_close_raw)
+                partial_close_val = min(1.0, max(0.0, partial_close_val))
+                signal_data["partial_close_pct"] = round(partial_close_val, 4)
+            except (TypeError, ValueError):
+                self._log_warning(
+                    "⚠️ Invalid partial_close_pct from LLM, dropping field"
+                )
+                signal_data.pop("partial_close_pct", None)
+
         # Add metadata
         signal_data["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         signal_data["reasoning_content"] = reasoning_content
         signal_data["llm_model"] = self.model
 
-        # Store in history
+        return signal_data
+
+    def _record_signal(self, signal_data: Dict[str, Any]) -> None:
+        """Persist signal/fallback in history so previous_signal never goes stale."""
         self.signal_history.append(signal_data)
         if len(self.signal_history) > 30:
             self.signal_history.pop(0)
-
-        # Log signal statistics
         self._log_signal_stats(signal_data)
-
-        return signal_data
 
     def _build_prompt_payload(
         self,
@@ -540,7 +638,9 @@ class DeepSeekAnalyzer:
             "microstructure": micro_summary,
             "kline_tail_5": kline_summary,
             "sentiment": sentiment_summary,
-            "previous_signal": self.signal_history[-1] if self.signal_history else None,
+            "previous_signal": self._compact_previous_signal(
+                self.signal_history[-1] if self.signal_history else None
+            ),
             "micro_tf_windows": compact_windows if compact_windows else None,
         }
 
@@ -571,6 +671,22 @@ class DeepSeekAnalyzer:
             "open_orders": open_orders[:5],
             "recent_trade_summary": trade_summary,
         }
+
+    def _estimate_round_trip_friction_bps(self, price_data: Dict[str, Any]) -> float:
+        """
+        Estimate round-trip trading friction in basis points.
+
+        friction = round-trip taker fees + live spread (crossed on entry+exit)
+        + a small slippage buffer. Used to give the LLM a concrete breakeven so
+        it stops locking gross gains that are net-negative after costs.
+        """
+        micro = price_data.get("microstructure") or {}
+        try:
+            spread_bps = float(micro.get("spread_bps") or 0.0)
+        except (TypeError, ValueError):
+            spread_bps = 0.0
+        spread_bps = max(0.0, spread_bps)
+        return self.ROUND_TRIP_FEE_BPS + spread_bps + self.SLIPPAGE_BUFFER_BPS
 
     def _build_analysis_prompt(
         self,
@@ -609,6 +725,13 @@ class DeepSeekAnalyzer:
         # Position health context for scalp-aware decision making
         position_health_text = self._format_position_health(current_position)
 
+        # Concrete round-trip cost so the model can size net edge vs gross move.
+        friction_bps = self._estimate_round_trip_friction_bps(price_data)
+        friction_text = (
+            f"FRICTION round_trip~={friction_bps:.1f}bps (~{friction_bps / 100:.3f}% "
+            "gross move just to break even; need gross profit clearly above this to net positive)"
+        )
+
         prompt = (
             f"{self.pair_label} | {self.timeframe_label} | SCALP ANALYSIS — output JSON only.\n\n"
             f"{kline_text}\n"
@@ -617,6 +740,7 @@ class DeepSeekAnalyzer:
             f"{sentiment_text}\n"
             f"{risk_context_text}\n"
             f"{position_health_text}\n"
+            f"{friction_text}\n"
             f"{signal_text}\n"
             "CURRENT\n"
             f"price={price_data['price']:.4f} time={price_data['timestamp']} "
@@ -627,12 +751,20 @@ class DeepSeekAnalyzer:
             f"trend={technical_data.get('overall_trend')} st={technical_data.get('short_term_trend')} "
             f"rsi={technical_data.get('rsi', 0):.1f} macd_side={technical_data.get('macd_trend')}\n\n"
             "DECISION FRAMEWORK (scalp):\n"
-            "- If holding a profitable position: strongly consider TAKING PROFIT (signal opposite to close).\n"
-            "- If uPnL was higher before and is now declining (giveback): EXIT before it turns negative.\n"
-            "- If flat: only enter on strong directional evidence with volume confirmation.\n"
-            "- Scalp targets: 0.3-0.8% profit is a good trade. Do not hold for 2-3%.\n\n"
+            "- Step 1: classify regime and structure using trend + volume + OFI/depth/spread/liquidity context.\n"
+            "- Step 2: classify thesis state for current position: intact / weakening / invalidated.\n"
+            "- Step 3: compare expected move quality to FRICTION; prefer actions with clear net edge after costs.\n"
+            "- If thesis is intact and momentum/flow remain supportive, prefer HOLD or partial REDUCE (not forced full EXIT).\n"
+            "- If thesis is weakening, prefer partial REDUCE or tighter risk posture; full EXIT only on clear invalidation.\n"
+            "- If thesis is invalidated, EXIT promptly.\n"
+            "- Never justify EXIT using tiny gross profit alone; require structural/liquidity reason.\n"
+            "- You may partially close positions by setting partial_close_pct between 0.0 and 1.0.\n"
+            "- If flat: enter only when directional, volume, and liquidity evidence align and expected edge exceeds friction.\n"
+            "- If exchange/local state looks conflicting or stale, prefer HOLD and wait for confirmation.\n"
+            "- If exchange_position in RISK is flat, treat exposure as flat (do not act as if position exists).\n"
+            "- If evidence is mixed or low quality, HOLD (NO_ACTION).\n\n"
             "Output: single JSON object in English, no markdown.\n"
-            'Schema (all string values except optional stop_loss/take_profit numbers):\n'
+            'Schema (all string values except optional stop_loss/take_profit/partial_close_pct numbers):\n'
             "{\n"
             '  "signal": "BUY|SELL|HOLD",\n'
             '  "confidence": "HIGH|MEDIUM|LOW",\n'
@@ -642,7 +774,8 @@ class DeepSeekAnalyzer:
             '  "execution_note": "scaling/spread/friction-aware note",\n'
             '  "volume_note": "volume context",\n'
             '  "risk_assessment": "LOW|MEDIUM|HIGH",\n'
-            '  "trend_strength": "STRONG|MODERATE|WEAK"\n'
+            '  "trend_strength": "STRONG|MODERATE|WEAK",\n'
+            '  "partial_close_pct": 0.4\n'
             "}\n"
             "BUY = go long / close short. SELL = go short / close long. HOLD = do nothing.\n"
             "Optional: stop_loss, take_profit (numbers or omit).\n"

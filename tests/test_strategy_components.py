@@ -179,6 +179,152 @@ def test_deepseek_synthesis_parse_and_journal_fields():
     assert "stop_loss" in result and "take_profit" in result
 
 
+def test_deepseek_warns_on_non_english_synthesis_but_uses_signal(caplog):
+    import types
+
+    synth = {
+        "signal": "BUY",
+        "confidence": "HIGH",
+        "regime": "强势上涨",
+        "thesis": "价格上涨，建议买入。",
+        "invalidation": "跌破支撑位",
+        "execution_note": "分批进场",
+        "volume_note": "放量上涨",
+        "risk_assessment": "MEDIUM",
+        "trend_strength": "STRONG",
+    }
+
+    openai_fake = types.ModuleType("openai")
+    MockOpenAI = Mock()
+    openai_fake.OpenAI = MockOpenAI
+
+    mock_client = MockOpenAI.return_value
+    mock_choice = Mock()
+    mock_choice.message.content = json.dumps(synth)
+    mock_choice.message.reasoning_content = "cn-output"
+    mock_client.chat.completions.create.return_value = Mock(choices=[mock_choice])
+
+    spec_ds = importlib.util.spec_from_file_location(
+        "deepseek_standalone_mod_cn", ROOT / "utils" / "deepseek_client.py"
+    )
+    assert spec_ds and spec_ds.loader
+
+    prev_mod = sys.modules.get("deepseek_standalone_mod_cn")
+    openai_prev = sys.modules.get("openai")
+    try:
+        sys.modules["openai"] = openai_fake
+        ds_mod = importlib.util.module_from_spec(spec_ds)
+        sys.modules["deepseek_standalone_mod_cn"] = ds_mod
+        spec_ds.loader.exec_module(ds_mod)
+        DeepSeekAnalyzer = ds_mod.DeepSeekAnalyzer
+
+        client = DeepSeekAnalyzer(
+            api_key="k",
+            model="m",
+            instrument_id="X-LINEAR.BYBIT",
+            bar_type="X-5-MINUTE-LAST",
+            max_retries=1,
+        )
+        price_data = {
+            "price": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "volume": 10.0,
+            "price_change": 0.1,
+            "timestamp": "2026-05-27T00:00:00Z",
+            "kline_data": [{"open": 99.5, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 10.0}],
+            "instrument_id": "X-LINEAR.BYBIT",
+            "bar_type": "X-5-MINUTE-LAST",
+        }
+        result = client.analyze(
+            price_data,
+            {"overall_trend": "强势上涨", "short_term_trend": "上涨", "rsi": 52.0},
+        )
+    finally:
+        if prev_mod is not None:
+            sys.modules["deepseek_standalone_mod_cn"] = prev_mod
+        else:
+            sys.modules.pop("deepseek_standalone_mod_cn", None)
+        if openai_prev is not None:
+            sys.modules["openai"] = openai_prev
+        else:
+            sys.modules.pop("openai", None)
+
+    assert result["signal"] == "BUY"
+    assert result.get("is_fallback") is not True
+    assert "价格上涨" in (result.get("reason") or "")
+    assert any(
+        "Non-English synthesis fields detected; using signal as-is." in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_deepseek_records_fallback_in_signal_history():
+    import types
+
+    openai_fake = types.ModuleType("openai")
+    MockOpenAI = Mock()
+    openai_fake.OpenAI = MockOpenAI
+
+    mock_client = MockOpenAI.return_value
+    mock_choice = Mock()
+    # Force parse failure to trigger fallback path
+    mock_choice.message.content = "not-json-response"
+    mock_choice.message.reasoning_content = "net-error"
+    mock_client.chat.completions.create.return_value = Mock(choices=[mock_choice])
+
+    spec_ds = importlib.util.spec_from_file_location(
+        "deepseek_standalone_mod_fallback", ROOT / "utils" / "deepseek_client.py"
+    )
+    assert spec_ds and spec_ds.loader
+
+    prev_mod = sys.modules.get("deepseek_standalone_mod_fallback")
+    openai_prev = sys.modules.get("openai")
+    try:
+        sys.modules["openai"] = openai_fake
+        ds_mod = importlib.util.module_from_spec(spec_ds)
+        sys.modules["deepseek_standalone_mod_fallback"] = ds_mod
+        spec_ds.loader.exec_module(ds_mod)
+        DeepSeekAnalyzer = ds_mod.DeepSeekAnalyzer
+
+        client = DeepSeekAnalyzer(
+            api_key="k",
+            model="m",
+            instrument_id="X-LINEAR.BYBIT",
+            bar_type="X-5-MINUTE-LAST",
+            max_retries=1,
+        )
+        price_data = {
+            "price": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "volume": 10.0,
+            "price_change": 0.1,
+            "timestamp": "2026-05-27T00:00:00Z",
+            "kline_data": [{"open": 99.5, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 10.0}],
+            "instrument_id": "X-LINEAR.BYBIT",
+            "bar_type": "X-5-MINUTE-LAST",
+        }
+        result = client.analyze(
+            price_data,
+            {"overall_trend": "strong_up", "short_term_trend": "up", "rsi": 52.0},
+        )
+    finally:
+        if prev_mod is not None:
+            sys.modules["deepseek_standalone_mod_fallback"] = prev_mod
+        else:
+            sys.modules.pop("deepseek_standalone_mod_fallback", None)
+        if openai_prev is not None:
+            sys.modules["openai"] = openai_prev
+        else:
+            sys.modules.pop("openai", None)
+
+    assert result["signal"] == "HOLD"
+    assert result.get("is_fallback") is True
+    assert len(client.signal_history) == 1
+    assert client.signal_history[-1].get("is_fallback") is True
+
+
 def test_trade_journal_writes_header_once():
     import tempfile
 

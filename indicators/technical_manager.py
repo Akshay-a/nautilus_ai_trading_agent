@@ -369,8 +369,10 @@ class TechnicalIndicatorManager:
             confirmation = "bullish_volume_confirmed"
         elif body_dir < 0 and vol_excess > 0.25:
             confirmation = "bearish_volume_confirmed"
-        elif body_dir != 0 and vol_excess < -0.2:
-            confirmation = "weak_volume_drift"
+        elif body_dir > 0 and vol_excess < -0.2:
+            confirmation = "up_move_weak_volume"
+        elif body_dir < 0 and vol_excess < -0.2:
+            confirmation = "down_move_weak_volume"
 
         zs = float(volume_zscore)
         if zs < -0.75:
