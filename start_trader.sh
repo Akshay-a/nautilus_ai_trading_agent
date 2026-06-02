@@ -30,10 +30,19 @@ if [ -n "$existing_pids" ]; then
   exit 1
 fi
 
-nohup python main_live.py > "logs/trader_$(date +%Y%m%d_%H%M%S).log" 2>&1 &
-echo $! > trader.pid
+log_file="logs/trader_$(date +%Y%m%d_%H%M%S).log"
+nohup python -u main_live.py > "$log_file" 2>&1 &
+trader_pid=$!
+echo "$trader_pid" > trader.pid
+
+sleep 2
+if ! kill -0 "$trader_pid" 2>/dev/null; then
+  rm -f trader.pid
+  echo "Trading strategy failed to remain running. Review: $log_file"
+  exit 1
+fi
 
 echo "Trading strategy started with PID: $(cat trader.pid)"
 echo "Mode: BYBIT_DEMO=true, BYBIT_TESTNET=false, DRY_RUN=false, TIMEFRAME=5m, TIMER_INTERVAL_SEC=300"
-echo "View logs: tail -f logs/trader_*.log"
+echo "View logs: tail -f $log_file"
 echo "Stop trader: ./stop_trader.sh"

@@ -26,6 +26,7 @@ class TradeJournalCSV:
         "bar_ts_event",
         "bar_ts_init",
         "signal",
+        "position_action",
         "confidence",
         "trend_strength",
         "risk_assessment",
@@ -74,6 +75,9 @@ class TradeJournalCSV:
         "execution_target_side",
         "execution_target_quantity",
         "execution_note",
+        "bracket_levels_source",
+        "bracket_stop_loss",
+        "bracket_take_profit",
         "technical_snapshot_json",
         "microstructure_snapshot_json",
         "risk_context_json",
@@ -102,8 +106,30 @@ class TradeJournalCSV:
     ]
 
     def __init__(self, path: str):
-        self.path = path
+        self.path = self._schema_compatible_path(path)
         self._lock = threading.Lock()
+
+    @classmethod
+    def _schema_compatible_path(cls, path: str) -> str:
+        """Roll over append-only journals when the configured file has an older schema."""
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            return path
+        with open(path, "r", newline="", encoding="utf-8") as fh:
+            header = next(csv.reader(fh), [])
+        if header == cls.FIELDNAMES:
+            return path
+
+        stem, ext = os.path.splitext(path)
+        version = 2
+        while True:
+            candidate = f"{stem}.v{version}{ext or '.csv'}"
+            if not os.path.exists(candidate) or os.path.getsize(candidate) == 0:
+                return candidate
+            with open(candidate, "r", newline="", encoding="utf-8") as fh:
+                candidate_header = next(csv.reader(fh), [])
+            if candidate_header == cls.FIELDNAMES:
+                return candidate
+            version += 1
 
     def append(self, row: Dict[str, Any]) -> None:
         """Append one row to the journal, creating header on first write."""

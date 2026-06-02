@@ -76,15 +76,15 @@ def test_position_sizing_respects_minimum_notional():
     importlib.util.find_spec("nautilus_trader") is None,
     reason="nautilus_trader not installed",
 )
-def test_position_sizing_scales_with_confidence():
+def test_position_sizing_uses_fixed_margin_times_leverage_without_confidence_scaling():
     mod = _load_deepseek_strategy_module()
     DeepSeekAIStrategy = mod.DeepSeekAIStrategy
 
     strategy = DeepSeekAIStrategy.__new__(DeepSeekAIStrategy)
     strategy.equity = 10000.0
-    strategy.base_usdt = 1000.0
-    strategy.fixed_trade_usdt = 0.0
-    strategy.leverage = 10.0
+    strategy.base_usdt = 2500.0
+    strategy.fixed_trade_usdt = 2500.0
+    strategy.leverage = 20.0
     strategy.rsi_extreme_mult = 0.7
     strategy.rsi_extreme_upper = 75.0
     strategy.rsi_extreme_lower = 25.0
@@ -97,7 +97,7 @@ def test_position_sizing_scales_with_confidence():
         'high_confidence_multiplier': 1.5,
         'medium_confidence_multiplier': 1.0,
         'low_confidence_multiplier': 0.5,
-            'max_position_ratio': 0.50,
+        'max_position_ratio': 20.0,
         'min_trade_amount': 0.001,
         'trend_strength_multiplier': 1.2,
     }
@@ -112,7 +112,8 @@ def test_position_sizing_scales_with_confidence():
             risk_context=None,
         )
 
-    assert sizes['LOW'] < sizes['MEDIUM'] < sizes['HIGH']
+    assert sizes['LOW'] == sizes['MEDIUM'] == sizes['HIGH']
+    assert pytest.approx(sizes['MEDIUM'] * 90000.0, rel=0.001) == 50000.0
 
 
 def test_deepseek_synthesis_parse_and_journal_fields():
@@ -121,6 +122,7 @@ def test_deepseek_synthesis_parse_and_journal_fields():
 
     synth = {
         "signal": "HOLD",
+        "position_action": "NO_ACTION",
         "confidence": "MEDIUM",
         "regime": "range_compress",
         "thesis": "Balanced liquidity; wait for breakout.",
@@ -184,6 +186,7 @@ def test_deepseek_warns_on_non_english_synthesis_but_uses_signal(caplog):
 
     synth = {
         "signal": "BUY",
+        "position_action": "ENTER_LONG",
         "confidence": "HIGH",
         "regime": "强势上涨",
         "thesis": "价格上涨，建议买入。",
@@ -325,6 +328,204 @@ def test_deepseek_records_fallback_in_signal_history():
     assert client.signal_history[-1].get("is_fallback") is True
 
 
+def test_position_health_formatting_is_observational_not_exit_biased():
+    import types
+
+    openai_fake = types.ModuleType("openai")
+    MockOpenAI = Mock()
+    openai_fake.OpenAI = MockOpenAI
+
+    spec_ds = importlib.util.spec_from_file_location(
+        "deepseek_standalone_mod_health", ROOT / "utils" / "deepseek_client.py"
+    )
+    assert spec_ds and spec_ds.loader
+
+    prev_mod = sys.modules.get("deepseek_standalone_mod_health")
+    openai_prev = sys.modules.get("openai")
+    try:
+        sys.modules["openai"] = openai_fake
+        ds_mod = importlib.util.module_from_spec(spec_ds)
+        sys.modules["deepseek_standalone_mod_health"] = ds_mod
+        spec_ds.loader.exec_module(ds_mod)
+        DeepSeekAnalyzer = ds_mod.DeepSeekAnalyzer
+        client = DeepSeekAnalyzer(
+            api_key="k", model="m", instrument_id="X-LINEAR.BYBIT", bar_type="X-5-MINUTE-LAST"
+        )
+        text = client._format_position_health(
+            {
+                "position_health": {
+                    "profit_pct": 0.03,
+                    "peak_profit_pct": 0.25,
+                    "giveback_pct": 45.0,
+                    "bars_held": 8,
+                    "recommendation": "minor_giveback",
+                }
+            }
+        )
+    finally:
+        if prev_mod is not None:
+            sys.modules["deepseek_standalone_mod_health"] = prev_mod
+        else:
+            sys.modules.pop("deepseek_standalone_mod_health", None)
+        if openai_prev is not None:
+            sys.modules["openai"] = openai_prev
+        else:
+            sys.modules.pop("openai", None)
+
+    assert "strongly consider exiting" not in text
+    assert "profit evaporating" not in text
+    assert "giveback observed" in text
+    assert "monitor invalidation proximity" in text
+
+
+def test_prompt_framework_reframes_exit_and_mid_range_behavior():
+    import types
+
+    openai_fake = types.ModuleType("openai")
+    MockOpenAI = Mock()
+    openai_fake.OpenAI = MockOpenAI
+
+    spec_ds = importlib.util.spec_from_file_location(
+        "deepseek_standalone_mod_prompt", ROOT / "utils" / "deepseek_client.py"
+    )
+    assert spec_ds and spec_ds.loader
+
+    prev_mod = sys.modules.get("deepseek_standalone_mod_prompt")
+    openai_prev = sys.modules.get("openai")
+    try:
+        sys.modules["openai"] = openai_fake
+        ds_mod = importlib.util.module_from_spec(spec_ds)
+        sys.modules["deepseek_standalone_mod_prompt"] = ds_mod
+        spec_ds.loader.exec_module(ds_mod)
+        DeepSeekAnalyzer = ds_mod.DeepSeekAnalyzer
+        client = DeepSeekAnalyzer(
+            api_key="k", model="m", instrument_id="X-LINEAR.BYBIT", bar_type="X-5-MINUTE-LAST"
+        )
+        prompt = client._build_analysis_prompt(
+            price_data={
+                "price": 100.0,
+                "high": 100.2,
+                "low": 99.8,
+                "volume": 12.0,
+                "price_change": 0.1,
+                "timestamp": "2026-06-02T10:10:00Z",
+                "kline_data": [{"open": 99.9, "high": 100.2, "low": 99.8, "close": 100.0, "volume": 12.0}],
+                "instrument_id": "X-LINEAR.BYBIT",
+                "bar_type": "X-5-MINUTE-LAST",
+                "microstructure": {"spread_bps": 1.2},
+                "market_state": {},
+            },
+            technical_data={
+                "overall_trend": "mixed",
+                "short_term_trend": "mixed",
+                "rsi": 50.0,
+                "macd_trend": "flat",
+            },
+            sentiment_data=None,
+            current_position={
+                "side": "short",
+                "quantity": 1.0,
+                "avg_px": 101.0,
+                "unrealized_pnl": 2.0,
+                "position_health": {
+                    "profit_pct": 0.02,
+                    "peak_profit_pct": 0.03,
+                    "giveback_pct": 10.0,
+                    "bars_held": 3,
+                    "recommendation": "stable",
+                },
+            },
+            risk_context={"open_orders": []},
+        )
+    finally:
+        if prev_mod is not None:
+            sys.modules["deepseek_standalone_mod_prompt"] = prev_mod
+        else:
+            sys.modules.pop("deepseek_standalone_mod_prompt", None)
+        if openai_prev is not None:
+            sys.modules["openai"] = openai_prev
+        else:
+            sys.modules.pop("openai", None)
+
+    assert "position_action\": \"ENTER_LONG|ENTER_SHORT|HOLD_POSITION|EXIT_NOW|NO_ACTION" in prompt
+    assert "do not exit because of small giveback alone" in prompt
+    assert "Mid-range -> prefer NO_ACTION" in prompt
+
+
+def test_market_state_prompt_text_uses_new_fields_without_removed_or_none_values():
+    import types
+
+    openai_fake = types.ModuleType("openai")
+    MockOpenAI = Mock()
+    openai_fake.OpenAI = MockOpenAI
+
+    spec_ds = importlib.util.spec_from_file_location(
+        "deepseek_standalone_mod_market_state", ROOT / "utils" / "deepseek_client.py"
+    )
+    assert spec_ds and spec_ds.loader
+
+    prev_mod = sys.modules.get("deepseek_standalone_mod_market_state")
+    openai_prev = sys.modules.get("openai")
+    try:
+        sys.modules["openai"] = openai_fake
+        ds_mod = importlib.util.module_from_spec(spec_ds)
+        sys.modules["deepseek_standalone_mod_market_state"] = ds_mod
+        spec_ds.loader.exec_module(ds_mod)
+        DeepSeekAnalyzer = ds_mod.DeepSeekAnalyzer
+        client = DeepSeekAnalyzer(
+            api_key="k", model="m", instrument_id="X-LINEAR.BYBIT", bar_type="X-5-MINUTE-LAST"
+        )
+        text = client._format_market_state(
+            {
+                "app_regime": "trend_down",
+                "position_key": "short:1.0",
+                "open_orders_count": 0,
+                "main_pressure": "selling",
+                "main_regime_shift": "stable",
+                "main_trade_flow_imbalance": -0.19,
+                "main_normalized_ofi_score": -0.27,
+                "support_12": 1980.0,
+                "resistance_12": 1992.0,
+                "support_48": 1960.0,
+                "resistance_48": 2004.0,
+                "position_invalidation_price": None,
+                # Removed gate-era fields that should never be emitted now:
+                "trend": "down",
+                "structure_state": "inside_range",
+                "volume_state": "normal",
+                "bb_state": "middle",
+                "trade_flow_state": "sell",
+                "depth_regime": "normal",
+                "fast_pressure": "neutral",
+                "context_pressure": "neutral",
+                "fast_regime_shift": "stable",
+            },
+            "micro_numeric_cross",
+        )
+    finally:
+        if prev_mod is not None:
+            sys.modules["deepseek_standalone_mod_market_state"] = prev_mod
+        else:
+            sys.modules.pop("deepseek_standalone_mod_market_state", None)
+        if openai_prev is not None:
+            sys.modules["openai"] = openai_prev
+        else:
+            sys.modules.pop("openai", None)
+
+    assert "main_normalized_ofi_score=-0.27" in text
+    assert "position_invalidation_price=" not in text
+    assert "=None" not in text
+    assert "trend=" not in text
+    assert "structure_state=" not in text
+    assert "volume_state=" not in text
+    assert "bb_state=" not in text
+    assert "trade_flow_state=" not in text
+    assert "depth_regime=" not in text
+    assert "fast_pressure=" not in text
+    assert "context_pressure=" not in text
+    assert "fast_regime_shift=" not in text
+
+
 def test_trade_journal_writes_header_once():
     import tempfile
 
@@ -399,6 +600,84 @@ def test_ob_tf_window_summaries_shape():
     assert fast["ready"] is True
     assert "spread_mean_bps" in fast
     assert "labels" in fast and "liquidity" in fast["labels"]
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("nautilus_trader") is None,
+    reason="nautilus_trader not installed",
+)
+def test_market_state_gate_skips_unchanged_hold_context():
+    mod = _load_deepseek_strategy_module()
+    DeepSeekAIStrategy = mod.DeepSeekAIStrategy
+
+    strategy = DeepSeekAIStrategy.__new__(DeepSeekAIStrategy)
+    strategy.enable_market_state_gate = True
+    strategy._force_next_llm_reason = None
+    strategy.last_signal = {"signal": "HOLD", "confidence": "MEDIUM"}
+
+    technical = {
+        "overall_trend": "mixed",
+        "adx": 12.0,
+        "dmi_dx": 10.0,
+        "support": 99.0,
+        "resistance": 101.0,
+        "atr": 1.0,
+        "atr_pct": 1.0,
+        "rvol": 0.9,
+        "volume_zscore": 0.1,
+        "bb_position": 0.5,
+    }
+    micro = {
+        "trade_flow_imbalance": 0.02,
+        "depth_regime": "normal",
+        "tf_windows": {
+            "fast": {"labels": {"directional_pressure": "neutral", "regime_shift": "stable"}},
+            "main": {"labels": {"directional_pressure": "neutral"}},
+            "context": {"labels": {"directional_pressure": "neutral"}},
+        },
+    }
+    price = {"price": 100.0, "high": 100.3, "low": 99.8}
+
+    state = strategy._build_market_state(price, technical, micro, None, {"open_orders": []})
+    strategy._last_llm_market_state = dict(state)
+
+    should_call, reason = strategy._should_call_llm(state, price)
+
+    assert should_call is False
+    assert reason == "no_material_market_change"
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("nautilus_trader") is None,
+    reason="nautilus_trader not installed",
+)
+def test_hold_partial_close_is_noop():
+    mod = _load_deepseek_strategy_module()
+    DeepSeekAIStrategy = mod.DeepSeekAIStrategy
+
+    strategy = DeepSeekAIStrategy.__new__(DeepSeekAIStrategy)
+    strategy.is_trading_paused = False
+    strategy.min_confidence = "MEDIUM"
+    strategy.latest_signal_data = None
+    strategy.latest_technical_data = None
+    strategy.latest_price_data = None
+    strategy._submit_order = Mock()
+
+    result = strategy._execute_trade(
+        signal_data={
+            "signal": "HOLD",
+            "position_action": "HOLD_POSITION",
+            "confidence": "HIGH",
+            "partial_close_pct": 0.5,
+        },
+        price_data={"price": 100.0},
+        technical_data={},
+        current_position={"side": "long", "quantity": 2.0},
+        risk_context=None,
+    )
+
+    assert result["action"] == "hold_position"
+    strategy._submit_order.assert_not_called()
 
 
 @pytest.mark.skipif(
