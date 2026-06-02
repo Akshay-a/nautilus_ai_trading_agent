@@ -30,3 +30,29 @@
 - Rule: avoid fixed profit-target/giveback ladders in LLM instructions unless there is direct log evidence for that exact threshold.
 - Rule: prioritize thesis-validity + market-structure + net-edge framing (hold/reduce/exit) over percentage-only exit rules.
 - Rule: explicitly preserve HOLD/NO_ACTION as a valid high-quality outcome when evidence is mixed, to reduce churn.
+
+## 2026-05-31 (Move-Capture Design Simplicity)
+- User correction: the proposed redesign added too many deterministic gates and audit fields before the bot has a clean directional trading layer.
+- Rule: for early move-capture redesigns, prefer a simple market-structure contract (range vs trend, ATR/volatility-aware TP/SL, maker orders, event-triggered re-analysis) over multi-threshold state machines.
+- Rule: do not over-instrument before the behavior is clean; keep logs sufficient for a 3-day review, then add fields only where the analysis is blocked.
+- Rule: prompt context should emphasize weekly/daily volatility, ATR, local/high-timeframe structure, and longer OB windows instead of tiny fixed profit-taking rules.
+
+## 2026-05-31 (RR Geometry Before Live Entries)
+- User correction: fixed percent TP with widened structural SL can create poor R:R, and re-analysis needs prior thesis/invalidation continuity.
+- Rule: before enabling move-capture entries, compute TP/SL geometry explicitly and block entries when structural target distance does not justify invalidation risk.
+- Rule: every LLM re-analysis prompt must include prior action, prior thesis, prior invalidation, prior regime, and bars since the prior LLM decision.
+- Rule: when fixed sizing/leverage is requested, make the prompt and execution config explicit about notional, leverage, and what 1R means; do not leave sizing semantics implicit.
+
+## 2026-06-01 (Deterministic Protection Before LLM Reanalysis)
+- User correction: LLM entries must always carry TP/SL protection, and ordinary open-position reanalysis should wait for microstructure or volume changes.
+- Rule: never depend on an asynchronous LLM call as the hard loss-control mechanism; attach exchange-side SL and TP protection before opening exposure.
+- Rule: when LLM levels are missing or invalid, use bounded deterministic bracket fallbacks and block the entry if the protected bracket cannot be submitted.
+- Rule: keep open-position LLM wakeups sparse; lifecycle events and price-only movement should not create analysis churn when deterministic bracket protection is active.
+
+## 2026-06-01 (Deployment Scope Over Rolling Window)
+- User correction: when requesting analysis after the latest deployment, scope exports to the active process session rather than forcing an approximate rolling-hour cutoff.
+- Rule: resolve PID -> process start -> matching JSON log first, then export the entire session unless the user explicitly requires a time slice.
+
+## 2026-06-02 (Verify Exchange Position Before Reporting)
+- User correction: the monitor summary exposed a stale open-position field after the exchange position had already closed.
+- Rule: before reporting current exposure, verify the latest Bybit risk context `position` field and recent executions; treat monitor-derived open-position summaries as stale when they conflict with exchange-backed context.

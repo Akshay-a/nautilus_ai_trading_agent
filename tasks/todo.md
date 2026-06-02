@@ -1,5 +1,131 @@
 # TODO
 
+## Plan (Historical Context-Parity Backtesting Research - 2026-06-02)
+- [x] Audit the current live and backtesting architecture for bar inputs, order book inputs, feature generation, and LLM-call parity.
+- [x] Verify whether `feature/backtesting-layer` adds anything not already present in `main`, and identify remaining replay gaps.
+- [x] Research primary-source historical data options for Bybit order book, trades, and bars, plus practical third-party/open-source replay stacks.
+- [x] Evaluate a minimal architecture that can replay the exact context the live bot would have seen at each decision point, including timezone/session alignment and market-regime testing.
+- [x] Write a recommendation with reliability tradeoffs, required code changes, and a verification path before any production rollout.
+
+## Review (Historical Context-Parity Backtesting Research - 2026-06-02)
+- Wrote [docs/HISTORICAL_CONTEXT_BACKTESTING_RESEARCH_20260602.md](/Users/akshayapsingi/Projects/nautilus_ai_trading_agent/docs/HISTORICAL_CONTEXT_BACKTESTING_RESEARCH_20260602.md).
+- Confirmed the current live strategy already uses bars + order book deltas + trade ticks + market-state gating in the LLM path, while the existing backtesting layer is still bar-only plus deterministic signal replay.
+- Confirmed `feature/backtesting-layer` is already merged: `main` is ahead by `4` commits and the feature branch is not ahead.
+- Source-backed recommendation:
+  - Primary historical source: `Tardis` for Bybit order book + trades replay.
+  - Fallback source: Bybit public archive downloads where available.
+  - Avoid using `CCXT / CCXT Pro` as the historical order book replay backbone.
+- Key replay constraint captured from source research: when using daily-snapshot L2 history, replay should warm from `00:00 UTC` for each evaluated day to ensure correct order book state before scoring intraday windows.
+- Required repo gap to close before trustworthy LLM backtests: ingest historical order book + trade ticks, rebuild microstructure state causally, and persist exact per-decision prompt/context artifacts.
+
+## Plan (LLM Decision Quality Review - 2026-06-02)
+- [x] Read the latest generated full-session LLM signal audit and scope the evidence window precisely.
+- [x] Cross-check observed LLM behavior against the current prompt, state-continuity payload, execution gate, and bracket lifecycle.
+- [x] Evaluate the proposed prompt changes as trading hypotheses: keep, revise, reject, and identify missing evidence.
+- [x] Write an evidence-backed strategy direction memo without changing live trading behavior.
+- [x] Add review notes and verify the memo against the inspected artifact and code references.
+
+## Review (LLM Decision Quality Review - 2026-06-02)
+- Wrote `docs/LLM_DECISION_QUALITY_REVIEW_20260602.md`.
+- Primary audited window: one deployment session from `2026-06-01 00:45:13 AEST` through `17:17:47 AEST`, with `196` parsed decisions (`187 HOLD`, `3 BUY`, `6 SELL`).
+- Audited realized PnL: `-1105.25 USDT` across eight closes. LLM latency median/p90/max: `7.75s / 13.6s / 22.8s`.
+- Prompt diagnosis: low RVOL and numeric friction are repeatedly interpreted as vetoes. Keep regime-specific reframing, passive-depth neutrality, and compact lifecycle continuity. Defer a live `7/12` scoring gate and fixed partial-exit rules until replay evidence exists.
+- Critical execution diagnosis: locally emulated pending entry parents are invisible to Bybit `open_orders`, allowing duplicate brackets and stale fills after `NO_ACTION`. Bracket/trailing protection is not proven exchange-native.
+- Additional P0 safety findings: `TEST_MODE` does not disable orders, shutdown cancels orders without flattening exposure, restart state is not restored, child-order rejection has no recovery invariant, orphan cleanup can race cache reconciliation, and sizing fallbacks can raise capped exposure.
+- No live strategy behavior was changed in this review.
+- Verification:
+  - Documentation diff check: `git diff --check`.
+  - Explorer read-only focused suite: `29 passed, 1 failed`; failure is an existing stale `tests/test_rounding_fix.py` fixture missing `fixed_trade_usdt`.
+
+## Plan (Current Deployment Full-Session Export - 2026-06-01)
+- [x] Confirm active process start time and matching JSON session log.
+- [x] Generate a new full-session quant CSV from the current deployment only.
+- [x] Generate a new full-session LLM signal audit from the same deployment rows.
+- [x] Verify decision range, row counts, and generated artifact paths.
+
+## Review (Current Deployment Full-Session Export - 2026-06-01)
+- Active process: `PID 71511`, started `2026-06-01 00:41:25 AEST`.
+- Matching source session: `logs/deepseek_trader_2026-05-31_144126:554.json`.
+- Generated deployment-scoped artifacts:
+  - `logs/llm_quant_dataset_pid71511_full_session_20260601.csv`
+  - `logs/llm_signal_audit_pid71511_full_session_20260601.md`
+- Snapshot includes `196` completed LLM decisions from `00:45:13 AEST` through `17:17:47 AEST`: `187 HOLD`, `3 BUY`, `6 SELL`.
+- The `17:20 AEST` LLM call was still in flight at export time and is intentionally excluded until a parsed decision is logged.
+
+## Plan (Protected Entries and Sparse Reanalysis - 2026-06-01)
+- [x] Make `position_action` authoritative and remove LLM partial/add/reversal execution paths.
+- [x] Require protected TP+SL brackets for every entry with LLM -> structural -> 1% fallback precedence.
+- [x] Restrict open-position LLM wakeups to material microstructure or volume changes.
+- [x] Run orphan reduce-only cleanup after closes and on every maintenance timer.
+- [x] Add journal fields and focused tests, then run compile/tests and a dry-run exit replay.
+
+## Review (Protected Entries and Sparse Reanalysis - 2026-06-01)
+- `position_action` now controls execution. `EXIT_NOW` always submits one full-quantity reduce-only close; exposed entry actions are rejected and cannot reverse.
+- Every accepted entry uses a linked protected bracket. Level precedence is valid LLM TP/SL, structural TP/SL, then symmetric 1% TP/SL. Missing price, disabled auto-SL/TP, or bracket submission failure blocks entry.
+- Open positions wake the LLM only on material order-book/microstructure or volume changes. Lifecycle events, price drift, trend/structure changes, ATR movement, and giveback do not independently wake it.
+- Orphan reduce-only cleanup runs after position close and on every ops timer. Journals roll to a versioned CSV when the configured append-only file has an older schema.
+- Verification:
+  - `python3 -m py_compile strategy/deepseek_strategy.py utils/deepseek_client.py utils/trade_journal.py main_live.py scripts/build_quant_dataset.py scripts/extract_llm_signals.py`
+  - `pytest tests/test_bracket_order.py -q` passed (`11 passed`).
+  - `pytest tests/test_strategy_components.py tests/test_risk_context.py -q` passed (`14 passed`).
+  - `pytest tests/test_integration_mock.py -q` passed (`2 passed`).
+  - Dry-run replay passed for long opposite `SELL + EXIT_NOW`, short same-side `SELL + EXIT_NOW`, and short opposite `BUY + EXIT_NOW`; each emitted one reduce-only close.
+- `pyright` could not run because it is not installed in the environment.
+- Stopped stale pre-fix trader PID `90110` after confirming direct Bybit demo state was flat with no open orders. Demo trading was not restarted automatically.
+
+## Plan (Last-20h LLM Order Forensics - 2026-05-31)
+- [x] Extract the exact last-20-hour LLM decision and execution window from current logs.
+- [x] Reconstruct every submitted order, fill, position transition, and realized PnL event.
+- [x] Trace strategy execution branches for entry, exit, reversal, and protective order scenarios.
+- [x] Re-run bounded LLM/quant analysis artifacts for the last 20 hours.
+- [x] Document root cause, scenario taxonomy, and operational risk findings.
+
+## Review (Last-20h LLM Order Forensics - 2026-05-31)
+- Generated bounded artifacts:
+  - `logs/llm_signal_audit_last20h_20260531_2316_AEST.md`
+  - `logs/llm_quant_dataset_last20h_20260531_2316_AEST.csv`
+- Window: approximately `2026-05-31 03:16 AEST` to `23:16 AEST`; `236` LLM decisions: `232 HOLD`, `2 BUY`, `2 SELL`.
+- Reconstructed three execution actions:
+  - `21:05 AEST`: flat -> long bracket entry, `BUY 24.72 ETH`, filled at `2022.32`.
+  - `22:05 AEST`: LLM requested `SELL + EXIT_NOW`; strategy treated opposite signal as reversal, closed long for `-143.19 USDT`, then opened short `24.76 ETH`.
+  - `22:25 AEST`: LLM requested `BUY + EXIT_NOW`; strategy again dispatched reversal legs concurrently. Non-reduce `BUY 24.72` filled before reduce-only `BUY 24.76`, reducing the short first; reduce-only order then filled the remaining `0.04`. Final exchange state: flat.
+- Root cause: `_execute_trade` does not enforce LLM `position_action`; `_manage_existing_position` maps any opposite signal to reversal when reversals are enabled.
+- Additional findings:
+  - `22:20 AEST` LLM requested `SELL + EXIT_NOW` while short; same-side logic retained the short and ignored the exit request.
+  - Reversal orders are dispatched back-to-back without awaiting close fill, creating fill-order race behavior.
+  - Reversal open legs use plain MARKET orders and bypass normal flat-state structural bracket SL/TP construction.
+  - `main_live.py` hardcodes `allow_reversals=True` and `require_high_confidence_for_reversal=False`.
+  - Quant CSV generator can overstate executed decisions because a `Position Sizing` log line marks a cycle as executed even when same-side logic submits no order.
+
+## Review (Bounded Overnight Quant Export - 2026-05-31)
+- Used `scripts/extract_llm_signals.py` and `scripts/build_quant_dataset.py` parsers on `logs/deepseek_trader_2026-05-30_154437:538.json`.
+- Filtered exact requested window: `2026-05-31 02:00:00 AEST` through the `10:30 AEST` decision cycle (`2026-05-30T16:00:00Z` to `<2026-05-31T00:31:00Z`).
+- Appended `102` decision rows to `logs/llm_quant_dataset.csv` after exactly five blank separator lines, without adding a duplicate header.
+- Generated bounded markdown audit `logs/llm_signal_audit_20260531_0200_1030_AEST.md`.
+- Verification: appended decisions run from `02:00:06 AEST` through `10:30:06 AEST`; all `102` signals are `HOLD`.
+
+## Review (Overnight Runtime Forensics - 2026-05-31)
+- Confirmed current live-demo bot process `PID 90110` started at `2026-05-31 01:44:36 AEST` and remained active through the investigation after `10:10 AEST`.
+- Confirmed active stdout log `logs/trader_20260531_014436.log`, JSON log `logs/deepseek_trader_2026-05-30_154437:538.json`, and `logs/trade_journal.csv` continued updating.
+- Current-process window produced `102` bar-close journal rows: all `HOLD`; execution outcomes were `64 hold`, `37 skipped`, and `1 gated`; there were `0` submitted orders and `0` fills.
+- Direct Bybit demo status query succeeded against `https://api-demo.bybit.com`: current ETH position is flat and open orders are empty.
+- Identified restart handoff immediately before the overnight run: prior process received `SIGTERM` at `2026-05-31 01:44:13 AEST`, exchange close execution occurred at `01:44:25 AEST`, and the new process launched at `01:44:36 AEST`.
+- Identified dashboard parser discrepancy: local reconstructed `open_position=SHORT 5.78` is stale reconciliation-history output; direct Bybit risk context is the source of truth and reports flat.
+- Confirmed `caffeinate` process is alive, but it is independent of trader startup; `start_trader.sh` / `restart_trader.sh` launched the actual bot.
+
+## Plan (Margin-Based Live Sizing Fix - 2026-05-31)
+- [x] Treat configured `fixed_trade_usdt` / `base_usdt_amount` as margin capital, not final notional.
+- [x] Multiply configured margin by configured leverage at the order sizing point.
+- [x] Update prompt/runtime labels so logs and LLM context say margin + notional clearly.
+- [x] Update focused sizing tests and run targeted verification.
+
+## Review (Margin-Based Live Sizing Fix - 2026-05-31)
+- Changed live sizing in `strategy/deepseek_strategy.py`: target notional is now `fixed_trade_usdt * leverage` or `base_usdt_amount * leverage`.
+- With `fixed_trade_usdt=2500` and `leverage=20`, the order sizing target is now `50000 USDT` notional before balance/equity caps and instrument rounding.
+- Updated startup logs, prompt risk-unit context, config comments, and docs to distinguish fixed margin from target notional.
+- No TP/SL behavior changed.
+- Verification: `python3 -m py_compile strategy/deepseek_strategy.py utils/deepseek_client.py main_live.py && pytest tests/test_strategy_components.py tests/test_risk_context.py -q` passed (`14 passed`).
+
 ## Plan (Prompt Autonomy Rebalance + External Research - 2026-05-29)
 - [x] Run focused external research on autonomous LLM trading policy design with cost/friction and regime dependence.
 - [x] Identify prompt-policy gaps versus current implementation (exit bias, threshold rigidity, win-rate trap risk).
@@ -636,3 +762,222 @@
 - Verification:
   - `python3 -m py_compile utils/deepseek_client.py strategy/deepseek_strategy.py indicators/technical_manager.py tests/test_strategy_components.py` passed.
   - `pytest tests/test_strategy_components.py -q` passed (`8 passed`).
+
+## Plan (LLM Quant Dataset Review + Prompt/Noise Recommendations - 2026-05-30)
+- [x] Regenerate `logs/llm_quant_dataset.csv` and `logs/llm_quant_dataset_dictionary.md` from current local logs using `scripts/build_quant_dataset.py`.
+- [x] Verify pandas load, shape, key field completeness, and headline signal/execution distributions.
+- [x] Delegate independent quant analyses:
+  - signal/actionable-trade quality and execution outcomes,
+  - HOLD validity and opportunity-cost/noise behavior,
+  - mistake taxonomy with prompt simplification focused on fewer noisy exits.
+- [x] Run a local cross-check analysis to reconcile subagent findings against the generated CSV.
+- [x] Produce the 3 best simple bot changes, each mapped to expected noise reduction, validation method, and implementation surface.
+- [x] Add a review section with generated artifacts, verification output, and caveats.
+
+## Review (LLM Quant Dataset Review + Prompt/Noise Recommendations - 2026-05-30)
+- Generated artifacts:
+  - `python scripts/build_quant_dataset.py --days 2 --sessions 3`
+  - `logs/llm_quant_dataset.csv`: 271 rows x 57 columns.
+  - `logs/llm_quant_dataset_dictionary.md`: refreshed column dictionary/methodology.
+- Verification:
+  - pandas load passed with shape `(271, 57)`.
+  - Sessions used:
+    - `deepseek_trader_2026-05-28_220130:577.json`
+    - `deepseek_trader_2026-05-28_220900:667.json`
+    - `deepseek_trader_2026-05-29_120816:248.json`
+  - Signal mix: 12 BUY, 8 SELL, 251 HOLD.
+  - Execution mix: 11 entries, 9 LLM exits, 8 bracket auto-exits, 167 low-confidence skips.
+  - Closed positions: 11, net realized PnL `-13.63 USDT`, 4 wins / 7 losses.
+- Independent subagent findings:
+  - Actionable signal review: BUY/SELL accuracy is acceptable at 1-6 bars but decays to 37.5% at 12 bars; SELL entries are especially noisy; LLM exits are a realized-PnL drag.
+  - HOLD review: flat HOLDs are mostly valid for short churn avoidance, but 12-bar opportunity cost is material; in-position HOLDs need explicit thesis-state audit labels.
+  - Mistake/prompt review: prompt still mixes scalp aggression with hold-winner wording; execution rails are also tight (`tp_medium=0.5%`, trailing activation `0.3%`, partial TP `0.4%`, emergency giveback auto-exit).
+- Recommended simple changes:
+  1. Add a new-entry alignment gate: MEDIUM entries require signal direction to agree with trade-flow imbalance and not directly fade `strong_up`/`strong_down`; countertrend/reversal entries require HIGH confidence. Backtest over the CSV would remove the two worst countertrend entries and improve kept-entry 3/6-bar signed expectancy.
+  2. Loosen automatic exits before changing the LLM heavily: raise trailing activation/distance, relax or disable partial TP, and move hard giveback exit toward LLM context unless it is a true emergency. Auto-exit and LLM-exit rows are currently negative realized-PnL contributors.
+  3. Simplify the prompt/schema around explicit `position_action`, `edge_quality`, `thesis_state`, and `hold_reason` so HOLD can be validated and exits are only tied to thesis invalidation, not tiny profit, RSI heat, or isolated microstructure.
+- Caveats:
+  - Sample is still underpowered: only 20 actionable signals, 11 entries, and 11 realized PnL rows.
+  - Forward returns are close-based; no intrabar stop/target-touch reconstruction.
+  - INFO logs expose headline features only; DEBUG prompt payloads are needed for full feature-importance analysis.
+
+## Plan (Append Latest LLM Quant Decisions - 2026-05-30)
+- [x] Inspect newest `deepseek_trader_*.json` files and current CSV max timestamp to confirm the missing time range.
+- [x] Extract decisions from the latest active log and update `logs/llm_quant_dataset.csv` without duplicate decision rows.
+- [x] Refresh `logs/llm_quant_dataset_dictionary.md` if the generator rewrites it.
+- [x] Verify pandas load, new shape, latest decision timestamp, and signal/execution counts.
+- [x] Record coverage and any caveats about log timestamp timezone/session windows.
+
+## Review (Append Latest LLM Quant Decisions - 2026-05-30)
+- Latest active log inspected: `logs/deepseek_trader_2026-05-29_120816:248.json`.
+  - File coverage at inspection: `2026-05-29T12:08:16Z` to `2026-05-30T11:20:01Z`.
+  - Existing CSV previously stopped at decision `2026-05-30 11:05:08`.
+  - Complete additional decisions found at `2026-05-30T11:10:13Z` and `2026-05-30T11:15:13Z`.
+  - The `2026-05-30T11:20:00Z` bar had started an LLM call but did not yet have an `LLM Response JSON`, so it was not included.
+- Regenerated deterministic dataset:
+  - `python scripts/build_quant_dataset.py --days 2 --sessions 3`
+  - `logs/llm_quant_dataset.csv`: 273 rows x 57 columns.
+  - `logs/llm_quant_dataset_dictionary.md`: refreshed.
+- Verification:
+  - pandas load passed with shape `(273, 57)`.
+  - Latest decision timestamp: `2026-05-30 11:15:13` UTC (`2026-05-30 21:15:13` Australia/Sydney).
+  - Signal mix: 12 BUY, 8 SELL, 253 HOLD.
+  - Execution status: 28 executed, 75 hold_no_action, 170 skipped_low_conf.
+  - Duplicate check on `(session_file, decision_idx, decision_ts)`: 0 duplicates.
+
+## Plan (Principal Quant Review - LLM Move Capture / HOLD / Partial Decay - 2026-05-30)
+- [ ] Inspect current decision and execution ordering around LLM signal logging, `_execute_trade`, HOLD handling, partial-close application, order submission, and schema normalization.
+- [ ] Analyze `logs/llm_quant_dataset.csv` using required fields for directional signal quality, HOLD validity, partial-close decay, confidence calibration, regime/microstructure segmentation, and cost-adjusted expectancy.
+- [ ] Cross-check `logs/trade_journal.csv` and recent `logs/deepseek_trader_*.json` / `logs/trader_*.log` for execution examples, reduce-only chains, realized PnL placement, and bracket/manual exit separation.
+- [ ] Produce evidence-backed diagnostic narrative, ranked root-cause hypotheses, alternative architectures, trade-offs, and a measurable validation plan for 1%-5% move capture.
+- [ ] Document review findings and residual data gaps in this file.
+
+## Review (Principal Quant Review - LLM Move Capture / HOLD / Partial Decay - 2026-05-30)
+- Code finding: `_execute_trade` applies `_apply_partial_close_from_signal` before the HOLD branch, so `HOLD + partial_close_pct > 0` submits reduce-only market orders despite prompt wording that HOLD means do nothing.
+- Schema/prompt finding: `partial_close_pct` is optional but shown in the schema example and normalized to 0..1; there is no required `position_action`, `thesis_state`, or `exit_reason` field to distinguish no-action HOLD from scale-out HOLD.
+- Config finding: live defaults remain scalp-biased for 1%-5% capture (`tp_medium_confidence_pct=0.005`, `tp_high_confidence_pct=0.008`, trailing activation `0.003`, partial TP at `0.004/0.008`).
+- Dataset finding: `logs/llm_quant_dataset.csv` has 273 decisions across 3 sessions, but 271 decisions are from one session; only 20 actionable BUY/SELL decisions, so signal-edge estimates are directional evidence, not statistically conclusive.
+- Quant finding: actionable entries are not yet capturing 1%-5% moves; entry max close-proxy MFE is <1% in the labeled sample, and round-trip net expectancy is negative after 0.1% per-fill fee at 3/6/12 bars.
+- HOLD finding: flat HOLD generally avoided churn, but 14/219 eligible 12-bar flat HOLD windows had a +1% or larger forward close-proxy upside move; medium-confidence flat HOLDs missed these much more often than low-confidence flat HOLDs.
+- In-position HOLD finding: 24 in-position HOLD rows had negative average 12-bar position-aligned return (-0.102%) and no 1% favorable close-proxy continuations in this sample.
+- Partial-close finding: 17 rows carried `partial_close_pct > 0`; 7 were HOLD rows and all 7 executed reduce-only. Repeated partial chains removed 58%-75.5% exposure in representative multi-bar chains.
+- Audit finding: the quant dataset labels 8 HOLD reduce-only rows as `auto_exit`; 7/8 also carried `partial_close_pct > 0`, so current fields do not reliably separate LLM HOLD scale-outs from bracket auto-exits.
+- Cost finding: 28 executed decision rows represented about $226.1k notional and about $226 estimated commission at 0.1% per fill; repeated scale-outs materially increase drag relative to single-entry/single-exit flows.
+- Residual gap: forward labels are close-to-close and MFE/MAE are close-proxy only; intrabar stop/target touch and true excursion require additional bar high/low or execution replay fields.
+
+## Plan (Set-and-Forget Move-Capture Redesign for 1%-5% Directional Moves - 2026-05-30)
+
+### Objective and design decision
+- Convert the system from a scalp/exposure-management bot into a structural "set-and-forget" move-capture bot targeting 1%-5% directional moves.
+- Core principle (caveman): catch fish, set trap (SL+TP on structure), walk away. Do not keep poking the fish with per-bar resizes/partials.
+- Operator decision (confirmed): OVERWRITE existing scalp risk defaults in `configs/strategy_config.yaml` with move-capture values (no separate profile).
+- No trading logic changed yet; this section is the build plan only.
+
+### Confirmed code levers (grounded)
+- LLM is called every 5m bar unconditionally in `_run_bar_close_decision_cycle` (`strategy/deepseek_strategy.py`:984). No pre-LLM gate exists. This is both the token burn and the churn source.
+- `_execute_trade` runs `_apply_partial_close_from_signal` (`strategy/deepseek_strategy.py`:1564) BEFORE the HOLD no-op branch (:1572), so `HOLD + partial_close_pct` still reduces.
+- Entries already use a bracket: MARKET entry + STOP_MARKET SL at support/resistance + LIMIT TP, but TP is a FIXED scalp pct (`tp_*_confidence_pct` 0.3/0.5/0.8%), so the bracket cannot reach 1%-5% by construction (`_submit_bracket_order` :2041-2047).
+- Churn/exit paths are MARKET (taker): partial reduces, reversals, and the 60%-giveback breaker (`_run_bar_close_decision_cycle` :928-973). The LIMIT TP is the only maker exit and is rarely reached because it is set at <=0.8%.
+- S/R comes from `technical_manager` with `support_resistance_lookback: 20` (~100 min on 5m) — likely too tight to find a 1%-5% structural target; needs widening / multi-level swing S/R.
+
+### Ranked build steps (smallest/safest first)
+- [ ] Step 1 - Kill accidental churn (safe, tiny):
+  - [ ] Reorder `_execute_trade` so the HOLD no-op branch runs BEFORE `_apply_partial_close_from_signal` (or remove the partial path entirely in v1).
+  - [ ] Replace free-form `partial_close_pct` output with a `position_action` contract:
+    - flat: `ENTER_LONG | ENTER_SHORT | NO_ACTION`
+    - in-position: `HOLD_POSITION | EXIT_NOW`
+    - v1 explicitly removes partial/add/resize authority from the LLM.
+  - [ ] Make HOLD truly no-op everywhere; LLM cannot reduce exposure in v1.
+- [ ] Step 2 - Make the bracket a move-capturer (the real 1%-5% mechanism, deterministic at execution layer):
+  - [ ] TP target = next structural level (long: nearest resistance above entry; short: nearest support below entry), not a fixed pct.
+  - [ ] Entry permission gate: only open when `tp_distance_pct` in [~1%, ~5%] AND `tp_dist / sl_dist >= R` (default R=1.5). If no 1%-5% structural room with acceptable R:R, do NOT trade.
+  - [ ] Widen / add multi-level swing S/R (and/or higher-timeframe levels) so 1%-5% targets are findable; make lookback configurable.
+  - [ ] Relax/disable scalp exits that fight the thesis: disable partial-TP, push trailing activation out (or off until >=+1% MFE), loosen/disable the 60%-giveback market breaker for the move-capture profile.
+- [ ] Step 3 - Pre-LLM material-change gate (token saver, deterministic, placed before `:984`):
+  - [ ] Maintain `last_decision_context` (regime label, trend label, S/R bracket, last-call price).
+  - [ ] When FLAT: skip LLM (journal `gated`) unless a setup is forming — regime/trend changed, OR `rvol >= ~1.2` / elevated `volume_zscore`, OR last bar range `>= k*atr` (k~0.5), OR price crossed a tracked S/R level.
+  - [ ] When IN-POSITION: bracket + trailing manage risk on the ops timer, so skipping is safe; only wake the LLM if price within X*ATR of SL, regime flips against the position, or a structure break occurs.
+  - [ ] Target: cut LLM calls ~5-10x and remove most quiet-tape over-trading.
+- [ ] Step 4 - Limit entry (optional, secondary commission tweak):
+  - [ ] Post-only LIMIT entry at/just inside the touch, cancel after 1-2 bars (no chasing), keep SL/TP bracket attached.
+  - [ ] Note: the dominant fee leak is MARKET churn, not entries; Steps 1-2 capture most commission savings with zero fill risk.
+- [ ] Step 5 - Audit fields + shadow counters (make next version measurable):
+  - [ ] Add fields: `position_action`, `hold_reason`, `edge_quality`, `thesis_state`, `exit_reason`, `previous_position_qty`, `post_trade_position_qty`, `exposure_retained_pct`, `cumulative_commission_estimate`, `partial_close_chain_id`, `bars_since_entry`, `bars_since_last_resize`, `entry_thesis_id`.
+  - [ ] Cleanly separate bracket/TP/SL exits from LLM exits in audit labels.
+
+### Config changes (OVERWRITE scalp defaults in configs/strategy_config.yaml)
+- [ ] Replace `tp_*_confidence_pct` scalp targets with structural-TP logic + 1%-5% floor/cap knobs (e.g. `tp_min_pct: 0.01`, `tp_max_pct: 0.05`, `min_rr: 1.5`).
+- [ ] `enable_partial_tp: false` (remove deterministic 0.4%/0.8% scale-outs).
+- [ ] Trailing: raise `trailing_activation_pct` to >= 0.01 (activate only after +1% MFE) or disable initially.
+- [ ] Widen `support_resistance_lookback` (and/or add HTF S/R) for 1%-5% targets.
+- [ ] Loosen/disable the 60%-giveback market breaker for move-capture.
+- [ ] Document every changed knob in README/QUICKSTART per repo rules.
+
+### Risk discipline / rollout
+- [ ] Shadow-log the risky deterministic gates first (Step 2 R:R/entry gate and Step 3 pre-LLM gate): record `would_enter`, `gated_reason`, `tp_target`, `rr` WITHOUT acting, then flip live once behavior is sane.
+- [ ] Steps 1 and 3 are low risk; Step 2 is the heaviest lift and the real edge driver and must be shadow-validated before enabling live entry suppression.
+- [ ] Keep Bybit exchange position/order as source of truth and friction-awareness intact.
+
+### Validation / success criteria (from principal quant review)
+- [ ] Median `exposure_retained_pct` > 70% during favorable moves until at least +1% MFE.
+- [ ] Reduce-only fills per winning trade <= 1 before +1% MFE.
+- [ ] Commission drag per closed trade materially lower than current 0.1%-per-fill churn model.
+- [ ] 6-bar and 12-bar in-position HOLD returns turn positive after cost (from -0.023% / -0.102%).
+- [ ] Entry net expectancy after 0.2% round trip positive at 6/12 bars.
+- [ ] Flat medium-confidence HOLD missed-1%-move rate falls from 24% without increasing low-quality churn.
+- [ ] No material increase in MAE, stop-outs, or uncontrolled drawdown.
+- [ ] Bracket exits and LLM exits cleanly separable in the dataset.
+
+### Open questions / residual gaps
+- [ ] Confirm S/R source quality for 1%-5% targets (current 20-bar 5m lookback likely too tight); decide HTF vs wider swing detection.
+- [ ] Decide whether v2 ever re-introduces a single PARTIAL_REDUCE (only if data justifies; off in v1).
+- [ ] Forward labels remain close-proxy; intrabar stop/target-touch validation needs bar high/low or execution replay.
+
+## Plan Revision (Lean Move-Capture Direction - 2026-05-31)
+- [ ] Keep the redesign simple: remove scalp profit bias, remove LLM partial-churn authority, and shift to range/trend structure with ATR/volatility-aware targets.
+- [ ] Range regime behavior: prefer support/resistance entries, SL at invalidation, TP at prior H1/H4/local high-low or half-range target depending on ATR and daily/weekly volatility.
+- [ ] Trend regime behavior: allow simple partial only as an explicit trend-management action, e.g. book around 0.5R and keep runner until next decision trigger; do not repeatedly resize every bar.
+- [ ] Use maker-style LIMIT orders for entries and planned TPs where practical; avoid market orders except protective SL/emergency close.
+- [ ] Reduce LLM cadence by triggering re-analysis on state changes: entry fill, SL fill, TP fill, bracket state change, material regime/structure change, or materially different OB context.
+- [ ] Improve LLM context: include daily/weekly volatility, ATR, H1/H4/local structure, range/trend classification, active bracket/position state, and longer OB-window summaries so decisions are not dominated by one noisy 5m candle.
+- [ ] Keep logs clean enough for a 3-day trading analysis before adding heavy audit machinery.
+
+## Plan (Market-Change LLM Decision Layer - 2026-05-31)
+- [ ] Add a lightweight market-state snapshot from existing computed features: trend/regime, support/resistance, ATR/BB, volume, and multi-window OB labels.
+- [ ] Gate bar-close LLM calls when the prior LLM action remains valid and market state has not materially changed; keep first call, position changes, structure breaks, volume/ATR shocks, and microstructure shifts as trigger reasons.
+- [ ] Journal gated/no-call cycles with `decision_cycle_trigger=market_state_gate` and a clear `gated_reason`, without submitting orders.
+- [ ] Refresh prompt framing away from scalp/candle reaction and toward regime + structure + volatility + microstructure re-analysis.
+- [ ] Remove accidental HOLD/partial churn so HOLD/no-action remains no execution.
+- [ ] Run compile and focused tests, then record review results.
+
+## Review (Market-Change LLM Decision Layer - 2026-05-31)
+- Implemented a lightweight app-layer market-state gate in `strategy/deepseek_strategy.py`.
+  - Tracks regime, trend, support/resistance structure, BB location, volume bucket, position/order state, and fast/main/context OB pressure labels.
+  - Calls DeepSeek only on first run, forced state events, position/order changes, regime/structure/volume/microstructure changes, half-ATR drift from last LLM call, one-ATR bar shock, or volume z-score shock.
+  - Gated cycles are journaled with `decision_cycle_trigger=market_state_gate`, `execution_status=gated`, and no order submission.
+- Reframed DeepSeek prompt in `utils/deepseek_client.py` away from scalp analysis toward market-change re-analysis, range/trend/transition reasoning, ATR/BB/structure, and longer OB window context.
+- Removed per-bar partial-close authority from the prompt/parser and made `HOLD + partial_close_pct` a no-op by checking HOLD before partial execution.
+- Converted the old 60% giveback market-exit breaker into a forced LLM re-analysis trigger, leaving deterministic protection to bracket SL behavior.
+- Added compact structural range features in `indicators/technical_manager.py`: 12/48/288-bar support, resistance, and range percent; default 5m interpretation is roughly H1/H4/day.
+- Updated move-capture defaults:
+  - wider `support_resistance_lookback: 48`,
+  - TP defaults 1%/2%/3% instead of 0.3%/0.5%/0.8%,
+  - trailing activation at +1%,
+  - partial TP disabled,
+  - `decision_layer.enable_market_state_gate: true`.
+- Updated `main_live.py` so YAML risk/decision-layer config now flows into `DeepSeekAIStrategyConfig` instead of relying only on class defaults.
+- Documentation updated in README/QUICKSTART for market-state-gated LLM cadence and move-capture risk defaults.
+- Verification:
+  - `python3 -m py_compile strategy/deepseek_strategy.py utils/deepseek_client.py indicators/technical_manager.py main_live.py tests/test_strategy_components.py` passed.
+  - `pytest tests/test_strategy_components.py -q` passed (`11 passed`).
+  - `pytest tests/test_integration_mock.py -q` passed (`2 passed`).
+- Residual implementation scope intentionally deferred:
+  - maker LIMIT entry/bracket conversion,
+  - explicit trend-only half-size-at-0.5R action,
+  - true H1/H4 bars instead of 12/48-bar approximations on the active timeframe,
+  - 3-day post-run quant review of gated vs called cycles.
+
+## Review (Paper-Trade Doc/Cleanup Pass - 2026-05-31)
+- [x] Rewrote [QUICKSTART.md](/Users/akshayapsingi/Projects/nautilus_ai_trading_agent/QUICKSTART.md) for Bybit demo paper trade: 2500 USDT fixed notional, 20x leverage, 5m cadence, market-state gate, structural bracket validation checklist.
+- [x] Updated [.env.template](/Users/akshayapsingi/Projects/nautilus_ai_trading_agent/.env.template) defaults (LEVERAGE=20, FIXED_TRADE_USDT=2500, TIMEFRAME=5m, ENABLE_MARKET_STATE_GATE).
+- [x] Updated [README.md](/Users/akshayapsingi/Projects/nautilus_ai_trading_agent/README.md) env example, config notes, and v1 execution model table (LIMIT bracket entries vs MARKET add/reverse).
+- [x] Fixed stale docstrings in [strategy/deepseek_strategy.py](/Users/akshayapsingi/Projects/nautilus_ai_trading_agent/strategy/deepseek_strategy.py) (`_open_new_position`, `_manage_existing_position`).
+- [x] Verification: `py_compile`, `pytest`, `git diff --check`.
+- Known v1 limitation documented: reversal/add flows remain MARKET-order based.
+
+## Plan (RR Geometry + Thesis Continuity Fix - 2026-05-31)
+- [ ] Add prior thesis/action/invalidation/regime and bars-since-decision into DeepSeek prompt context.
+- [ ] Add structural TP selection and R:R gate before opening a new bracket position so fixed-percent TP cannot pair with overly wide structural SL.
+- [ ] Make fixed position notional and leverage defaults explicit: `fixed_trade_usdt=2500`, `leverage=20`.
+- [ ] Add LLM-visible risk-unit context so 0.5R/0.75R/1R/2R/3R outcomes are evaluated against current bracket geometry.
+- [ ] Keep execution simple: no repeated partials, no market churn expansion, and block unsafe entries instead of asking LLM repeatedly.
+- [ ] Verify with compile and focused tests; document residual caveats.
+
+## Review (Demo Restart Validation - 2026-06-01)
+- [x] Re-ran compile checks, `git diff --check`, bracket tests (`11 passed`), and focused strategy/risk/integration tests (`16 passed`).
+- [x] Confirmed Nautilus Bybit config uses `environment=Demo`; the logged legacy `config.demo=False` field is not the active environment selector.
+- [x] Confirmed direct Bybit demo source of truth is flat with no open orders at `https://api-demo.bybit.com`.
+- [x] Ran a retained live-demo diagnostic through the first 5-minute bar close. Startup reanalysis returned `HOLD + NO_ACTION`, and execution submitted no order.
+- [x] Hardened `start_trader.sh`: unbuffered Python output plus a two-second fail-fast PID check.
+- [x] Started a durable macOS `launchctl` demo process with `TIMEFRAME=5m` and `TIMER_INTERVAL_SEC=300`; PID is recorded in `trader.pid`.
+- [x] Observed the durable process through its first 5-minute bar close. Startup reanalysis returned `HOLD + NO_ACTION`; PID remained alive and the direct Bybit demo account remained flat with no open orders.

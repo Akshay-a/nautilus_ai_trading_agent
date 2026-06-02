@@ -111,6 +111,7 @@ class TechnicalIndicatorManager:
                     bb_period,
                     volume_ma_period,
                     support_resistance_lookback,
+                    288,
                     atr_period,
                     directional_movement_period,
                 ]
@@ -268,6 +269,7 @@ class TechnicalIndicatorManager:
 
         # Support and Resistance
         support, resistance = self._calculate_support_resistance()
+        range_features = self._calculate_range_features(current_price)
 
         # Trend analysis
         trend_data = self._analyze_trend(
@@ -307,6 +309,7 @@ class TechnicalIndicatorManager:
             # Support/Resistance
             "support": support,
             "resistance": resistance,
+            **range_features,
             # Trend analysis
             **trend_data,
         }
@@ -399,6 +402,28 @@ class TechnicalIndicatorManager:
         resistance = max(float(bar.high) for bar in recent)
 
         return support, resistance
+
+    def _calculate_range_features(self, current_price: float) -> Dict[str, float]:
+        """
+        Calculate compact structural ranges.
+
+        The labels are bar-count based so they remain valid across timeframes;
+        on the default 5m setup, 12/48/288 bars approximate H1/H4/day.
+        """
+        features: Dict[str, float] = {}
+        for lookback in (12, 48, 288):
+            if len(self.recent_bars) < lookback or current_price <= 0:
+                features[f"support_{lookback}"] = 0.0
+                features[f"resistance_{lookback}"] = 0.0
+                features[f"range_{lookback}_pct"] = 0.0
+                continue
+            recent = self.recent_bars[-lookback:]
+            low = min(float(bar.low) for bar in recent)
+            high = max(float(bar.high) for bar in recent)
+            features[f"support_{lookback}"] = low
+            features[f"resistance_{lookback}"] = high
+            features[f"range_{lookback}_pct"] = ((high - low) / current_price) * 100.0
+        return features
 
     def _analyze_trend(
         self,

@@ -89,6 +89,16 @@ def get_env_int(key: str, default: str) -> int:
     return int(value)
 
 
+def get_env_bool(key: str, default: bool) -> bool:
+    """Safely get boolean environment variable."""
+    value = os.getenv(key)
+    if value is None:
+        return bool(default)
+    if '#' in value:
+        value = value.split('#')[0]
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def get_strategy_config() -> DeepSeekAIStrategyConfig:
     """
     Build strategy configuration from environment variables.
@@ -106,17 +116,19 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
     # Load YAML config
     yaml_config = load_yaml_config()
     strategy_yaml = yaml_config.get('strategy', {})
+    indicators_yaml = strategy_yaml.get('indicators', {})
+    risk_yaml = strategy_yaml.get('risk', {})
     
     # Get strategy parameters from env or use defaults
     equity = get_env_float('EQUITY', str(strategy_yaml.get('equity', '400')))
-    leverage = get_env_float('LEVERAGE', str(strategy_yaml.get('leverage', '10')))
+    leverage = get_env_float('LEVERAGE', str(strategy_yaml.get('leverage', '20')))
     base_position = get_env_float(
         'BASE_POSITION_USDT',
-        str(strategy_yaml.get('position_management', {}).get('base_usdt_amount', '30')),
+        str(strategy_yaml.get('position_management', {}).get('base_usdt_amount', '2500')),
     )
     fixed_trade_usdt = get_env_float(
         'FIXED_TRADE_USDT',
-        str(strategy_yaml.get('position_management', {}).get('fixed_trade_usdt', '0')),
+        str(strategy_yaml.get('position_management', {}).get('fixed_trade_usdt', '2500')),
     )
     max_position_ratio = get_env_float(
         'MAX_POSITION_RATIO',
@@ -131,7 +143,8 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
     # Debug output
     print(f"[CONFIG] Equity: {equity}")
     print(f"[CONFIG] Base Position: {base_position}")
-    print(f"[CONFIG] Fixed Trade Notional: {fixed_trade_usdt}")
+    print(f"[CONFIG] Fixed Trade Margin: {fixed_trade_usdt}")
+    print(f"[CONFIG] Target Trade Notional: {fixed_trade_usdt * leverage}")
     print(f"[CONFIG] Max Position Ratio: {max_position_ratio}")
     print(f"[CONFIG] Timeframe: {timeframe}")
 
@@ -188,6 +201,10 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
         macd_slow=10 if timeframe == '1m' else 26,
         bb_period=10 if timeframe == '1m' else 20,
         bb_std=2.0,
+        support_resistance_lookback=get_env_int(
+            'SUPPORT_RESISTANCE_LOOKBACK',
+            str(indicators_yaml.get('support_resistance_lookback', 48)),
+        ),
 
         # AI
         deepseek_api_key=deepseek_api_key,
@@ -207,11 +224,28 @@ def get_strategy_config() -> DeepSeekAIStrategyConfig:
 
         # Risk
         min_confidence_to_trade=get_env_str('MIN_CONFIDENCE_TO_TRADE', 'MEDIUM'),
-        allow_reversals=True,
-        require_high_confidence_for_reversal=False,
         rsi_extreme_threshold_upper=75.0,
         rsi_extreme_threshold_lower=25.0,
         rsi_extreme_multiplier=0.7,
+        enable_auto_sl_tp=risk_yaml.get('enable_auto_sl_tp', True),
+        sl_use_support_resistance=risk_yaml.get('sl_use_support_resistance', True),
+        sl_buffer_pct=float(risk_yaml.get('sl_buffer_pct', 0.001)),
+        tp_high_confidence_pct=float(risk_yaml.get('tp_high_confidence_pct', 0.03)),
+        tp_medium_confidence_pct=float(risk_yaml.get('tp_medium_confidence_pct', 0.02)),
+        tp_low_confidence_pct=float(risk_yaml.get('tp_low_confidence_pct', 0.01)),
+        min_entry_rr=float(risk_yaml.get('min_entry_rr', 0.5)),
+        default_target_r=float(risk_yaml.get('default_target_r', 1.0)),
+        max_target_r=float(risk_yaml.get('max_target_r', 3.0)),
+        enable_trailing_stop=risk_yaml.get('enable_trailing_stop', True),
+        trailing_activation_pct=float(risk_yaml.get('trailing_activation_pct', 0.01)),
+        trailing_distance_pct=float(risk_yaml.get('trailing_distance_pct', 0.005)),
+        trailing_update_threshold_pct=float(risk_yaml.get('trailing_update_threshold_pct', 0.002)),
+        enable_partial_tp=risk_yaml.get('enable_partial_tp', False),
+        partial_tp_levels=tuple(risk_yaml.get('partial_tp_levels', [])),
+        enable_market_state_gate=get_env_bool(
+            'ENABLE_MARKET_STATE_GATE',
+            strategy_yaml.get('decision_layer', {}).get('enable_market_state_gate', True),
+        ),
 
         # Execution
         position_adjustment_threshold=0.001,

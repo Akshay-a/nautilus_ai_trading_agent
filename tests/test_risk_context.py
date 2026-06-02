@@ -36,14 +36,14 @@ def _strategy_stub() -> Any:
     strategy.instrument = FakeInstrument()
     strategy.base_asset = "ETH"
     strategy.equity = 100000.0
-    strategy.leverage = 10.0
-    strategy.fixed_trade_usdt = 1000.0
-    strategy.base_usdt = 1000.0
+    strategy.leverage = 20.0
+    strategy.fixed_trade_usdt = 2500.0
+    strategy.base_usdt = 2500.0
     strategy.position_config = {
         "high_confidence_multiplier": 1.5,
         "medium_confidence_multiplier": 1.0,
         "low_confidence_multiplier": 0.5,
-        "max_position_ratio": 1.0,
+        "max_position_ratio": 20.0,
         "trend_strength_multiplier": 1.0,
         "min_trade_amount": 0.001,
         "adjustment_threshold": 0.001,
@@ -109,7 +109,7 @@ def test_sub_increment_order_quantity_is_skipped():
     assert strategy._normalize_order_quantity(0.011) == 0.01
 
 
-def test_position_size_varies_by_confidence_with_fixed_trade_base():
+def test_position_size_uses_fixed_margin_times_leverage_across_confidence_levels():
     strategy = _strategy_stub()
     price_data = {"price": 2000.0}
     technical_data = {"overall_trend": "neutral", "rsi": 50.0}
@@ -133,4 +133,5 @@ def test_position_size_varies_by_confidence_with_fixed_trade_base():
         current_position=None,
     )
 
-    assert low < medium < high
+    assert low == medium == high
+    assert low * price_data["price"] == 50000.0

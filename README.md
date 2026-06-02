@@ -52,9 +52,9 @@ The current live experiment uses:
 - Common demo instrument used during testing: `ETHUSDT-LINEAR.BYBIT`.
 - LLM provider: DeepSeek.
 - Default model: `deepseek-reasoner`.
-- Decision loop: configurable, currently tested heavily on `1m`.
-- Position sizing: fixed notional support through `FIXED_TRADE_USDT`.
-- Safety mode: `DRY_RUN=true` skips order submission.
+- Decision loop: **5-minute bars** by default (`TIMEFRAME=5m`); LLM calls are further gated by market-state changes.
+- Position sizing: **2500 USDT fixed margin** per protected entry (`fixed_trade_usdt`), **20x leverage** => **50000 USDT target notional**.
+- Safety mode: `DRY_RUN=true` skips order submission; `BYBIT_DEMO=true` for demo trading.
 
 The LLM receives a compact market payload plus a detailed prompt containing:
 
@@ -71,6 +71,7 @@ It must return strict JSON:
 ```json
 {
   "signal": "BUY|SELL|HOLD",
+  "position_action": "ENTER_LONG|ENTER_SHORT|HOLD_POSITION|EXIT_NOW|NO_ACTION",
   "confidence": "HIGH|MEDIUM|LOW",
   "reason": "analysis text",
   "stop_loss": 0,
@@ -136,10 +137,12 @@ INSTRUMENT_ID=ETHUSDT-LINEAR.BYBIT
 
 DEEPSEEK_API_KEY=your_deepseek_key
 
-TIMEFRAME=1m
-TIMER_INTERVAL_SEC=60
-FIXED_TRADE_USDT=10000
+TIMEFRAME=5m
+TIMER_INTERVAL_SEC=300
+FIXED_TRADE_USDT=2500
+LEVERAGE=20
 MIN_CONFIDENCE_TO_TRADE=MEDIUM
+ENABLE_MARKET_STATE_GATE=true
 ```
 
 Use `DRY_RUN=true` until you have verified the runtime path. Use `BYBIT_DEMO=true` for demo trading where supported by your credentials.
@@ -193,13 +196,26 @@ Key sections:
 
 - `strategy.instrument_id`: default trading instrument.
 - `strategy.bar_type`: Nautilus bar type.
-- `strategy.position_management.fixed_trade_usdt`: fixed notional target per new entry/reversal.
+- `strategy.position_management.fixed_trade_usdt`: fixed margin capital per protected entry (default **2500 USDT**; notional = margin x leverage).
+- `strategy.leverage`: reference leverage (default **20x**; must match exchange account setting).
 - `strategy.deepseek.model`: model name sent to DeepSeek.
 - `strategy.deepseek.kline_context_bars`: number of bars sent to the LLM.
 - `strategy.orderbook`: depth/trade buffers and microstructure settings.
-- `strategy.timer_interval_sec`: LLM decision cadence.
+- `strategy.decision_layer.enable_market_state_gate`: skips LLM calls while the previous decision remains valid and regime/structure/microstructure are unchanged.
+- `strategy.timer_interval_sec`: maintenance cadence; LLM analysis is further gated by market-state changes.
 - `strategy.warmup_bars`: historical bars fetched at startup.
-- `strategy.risk`: confidence filters, reversals, SL/TP, OCO, trailing stop, partial TP.
+- `strategy.risk`: confidence filters, structural SL/TP, `min_entry_rr`, OCO, and trailing stop. Partial TP is disabled by default for move-capture mode.
+
+### Execution model (v1)
+
+| Flow | Order type |
+|------|------------|
+| New entry (flat) | LIMIT post-only bracket + mandatory SL/TP |
+| LLM `EXIT_NOW` | MARKET reduce-only close; no automatic reversal |
+| Invalid LLM levels | Structural SL/TP, then symmetric 1% fallback |
+| Bracket submission failure / missing price | Entry blocked |
+
+New entries never fall back to an unprotected market order. Post-only LIMIT entries may not fill on every signal — track open orders on demo before trusting fill rate.
 
 Environment variables in `.env` override several YAML values. Check [main_live.py](main_live.py) before assuming a config key is final.
 

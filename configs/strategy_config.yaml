@@ -9,16 +9,16 @@ strategy:
 
   # Capital and leverage
   equity: 100000  # USDT reference equity for sizing caps
-  leverage: 10
+  leverage: 20
 
   # Position sizing
   position_management:
-    base_usdt_amount: 10000  # Fallback base size when fixed_trade_usdt is disabled
-    fixed_trade_usdt: 10000  # Fixed notional per new entry/reversal (demo objective)
+    base_usdt_amount: 2500  # Fallback margin capital when fixed_trade_usdt is disabled
+    fixed_trade_usdt: 2500  # Fixed margin capital per protected entry; notional = margin * leverage
     high_confidence_multiplier: 1.5
     medium_confidence_multiplier: 1.0
     low_confidence_multiplier: 0.5
-    max_position_ratio: 0.10  # Cap each position at 10% of equity
+    max_position_ratio: 20.0  # Notional cap as equity multiple; margin*leverage remains the primary limiter
     trend_strength_multiplier: 1.2
     min_trade_amount: 0.001  # Minimum BTC amount
 
@@ -33,7 +33,7 @@ strategy:
     bollinger_period: 20      # Standard Bollinger Band period
     bollinger_std: 2.0
     volume_ma_period: 20      # Standard volume MA period
-    support_resistance_lookback: 20  # Standard lookback for S/R levels
+    support_resistance_lookback: 48  # Wider structural S/R (~H4 on 5m bars)
 
   # AI configuration
   deepseek:
@@ -54,20 +54,21 @@ strategy:
   # Risk management
   risk:
     min_confidence_to_trade: "MEDIUM"  # LOW, MEDIUM, HIGH
-    allow_reversals: true
-    require_high_confidence_for_reversal: false  # Set to true for safer trading
     max_consecutive_same_signal: 5
     rsi_extreme_threshold_upper: 75
     rsi_extreme_threshold_lower: 25
     rsi_extreme_multiplier: 0.7
     
-    # Stop Loss & Take Profit — scalp-tuned targets
+    # Stop Loss & Take Profit — move-capture targets
     enable_auto_sl_tp: true
     sl_use_support_resistance: true
     sl_buffer_pct: 0.001
-    tp_high_confidence_pct: 0.008   # 0.8% — scalp-appropriate for 5m ETH
-    tp_medium_confidence_pct: 0.005 # 0.5%
-    tp_low_confidence_pct: 0.003    # 0.3%
+    tp_high_confidence_pct: 0.03    # 3.0% target when structure allows
+    tp_medium_confidence_pct: 0.02  # 2.0%
+    tp_low_confidence_pct: 0.01     # 1.0%
+    min_entry_rr: 0.5       # Block new entries if structural TP offers less than 0.5R
+    default_target_r: 1.0   # LLM may request 0.5R, 0.75R, 1R, 2R, or 3R
+    max_target_r: 3.0
     
     # OCO (One-Cancels-the-Other) Management
     enable_oco: true  # 启用 OCO 自动取消机制
@@ -77,17 +78,19 @@ strategy:
     oco_redis_password: null  # Redis 密码 (如果需要)
     oco_group_ttl_hours: 24  # OCO 组过期时间（小时）
     
-    # Trailing Stop Loss — scalp-tuned (lower thresholds for 5m bars)
+    # Trailing Stop Loss — move-capture; activates only after meaningful MFE
     enable_trailing_stop: true
-    trailing_activation_pct: 0.003    # Activate after 0.3% profit (was 1%)
-    trailing_distance_pct: 0.002      # Trail 0.2% behind price (was 0.5%)
-    trailing_update_threshold_pct: 0.001  # Update on 0.1% moves (was 0.2%)
+    trailing_activation_pct: 0.01    # Activate after +1% profit
+    trailing_distance_pct: 0.005     # Trail 0.5% behind price
+    trailing_update_threshold_pct: 0.002  # Update on 0.2% moves
     
-    # Partial Take Profit — scalp-tuned
-    enable_partial_tp: true
-    partial_tp_levels:
-      - {profit_pct: 0.004, position_pct: 0.5}  # Take 50% at 0.4% profit
-      - {profit_pct: 0.008, position_pct: 0.5}  # Take remaining 50% at 0.8% profit
+    # Partial Take Profit disabled for v1 to avoid repeated exposure decay
+    enable_partial_tp: false
+    partial_tp_levels: []
+
+  # Decision layer
+  decision_layer:
+    enable_market_state_gate: true  # Call LLM only on material regime/structure/microstructure changes
 
   # Telegram Notifications (Telegram 通知)
   telegram:

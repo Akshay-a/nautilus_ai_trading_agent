@@ -44,15 +44,15 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
 
     # Capital
     equity: float = 10000.0
-    leverage: float = 10.0
+    leverage: float = 20.0
 
     # Position sizing
-    base_usdt_amount: float = 100.0
-    fixed_trade_usdt: float = 0.0  # If > 0, use fixed notional target per entry/reversal
+    base_usdt_amount: float = 2500.0
+    fixed_trade_usdt: float = 2500.0  # If > 0, use fixed margin capital per protected entry
     high_confidence_multiplier: float = 1.5
     medium_confidence_multiplier: float = 1.0
     low_confidence_multiplier: float = 0.5
-    max_position_ratio: float = 0.10
+    max_position_ratio: float = 20.0
     trend_strength_multiplier: float = 1.2
     min_trade_amount: float = 0.001
 
@@ -63,6 +63,7 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     macd_slow: int = 26
     bb_period: int = 20
     bb_std: float = 2.0
+    support_resistance_lookback: int = 48
 
     # AI configuration
     deepseek_api_key: str = ""
@@ -78,8 +79,6 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
 
     # Risk management
     min_confidence_to_trade: str = "MEDIUM"
-    allow_reversals: bool = True
-    require_high_confidence_for_reversal: bool = False
     rsi_extreme_threshold_upper: float = 75.0
     rsi_extreme_threshold_lower: float = 25.0
     rsi_extreme_multiplier: float = 0.7
@@ -88,9 +87,12 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     enable_auto_sl_tp: bool = True
     sl_use_support_resistance: bool = True
     sl_buffer_pct: float = 0.001
-    tp_high_confidence_pct: float = 0.008
-    tp_medium_confidence_pct: float = 0.005
-    tp_low_confidence_pct: float = 0.003
+    tp_high_confidence_pct: float = 0.03
+    tp_medium_confidence_pct: float = 0.02
+    tp_low_confidence_pct: float = 0.01
+    min_entry_rr: float = 0.5
+    default_target_r: float = 1.0
+    max_target_r: float = 3.0
     
     # OCO (One-Cancels-the-Other)
     enable_oco: bool = True
@@ -102,16 +104,19 @@ class DeepSeekAIStrategyConfig(StrategyConfig, frozen=True):
     
     # Trailing Stop Loss
     enable_trailing_stop: bool = True
-    trailing_activation_pct: float = 0.003
-    trailing_distance_pct: float = 0.002
-    trailing_update_threshold_pct: float = 0.001
+    trailing_activation_pct: float = 0.01
+    trailing_distance_pct: float = 0.005
+    trailing_update_threshold_pct: float = 0.002
     
     # Partial Take Profit
-    enable_partial_tp: bool = True
+    enable_partial_tp: bool = False
     partial_tp_levels: Tuple[Dict[str, float], ...] = (
         {"profit_pct": 0.004, "position_pct": 0.5},
         {"profit_pct": 0.008, "position_pct": 0.5},
     )
+
+    # LLM decision cadence
+    enable_market_state_gate: bool = True
     
     # Telegram Notifications
     enable_telegram: bool = False
@@ -181,8 +186,6 @@ class DeepSeekAIStrategy(Strategy):
 
         # Risk management
         self.min_confidence = config.min_confidence_to_trade
-        self.allow_reversals = config.allow_reversals
-        self.require_high_conf_reversal = config.require_high_confidence_for_reversal
         self.rsi_extreme_upper = config.rsi_extreme_threshold_upper
         self.rsi_extreme_lower = config.rsi_extreme_threshold_lower
         self.rsi_extreme_mult = config.rsi_extreme_multiplier
@@ -196,6 +199,9 @@ class DeepSeekAIStrategy(Strategy):
             'MEDIUM': config.tp_medium_confidence_pct,
             'LOW': config.tp_low_confidence_pct,
         }
+        self.min_entry_rr = config.min_entry_rr
+        self.default_target_r = config.default_target_r
+        self.max_target_r = config.max_target_r
         
         # Store latest signal, technical, and price data for SL/TP calculation
         self.latest_signal_data: Optional[Dict[str, Any]] = None
@@ -236,6 +242,7 @@ class DeepSeekAIStrategy(Strategy):
             macd_slow=config.macd_slow,
             bb_period=config.bb_period,
             bb_std=config.bb_std,
+            support_resistance_lookback=config.support_resistance_lookback,
         )
 
         # Order Book / Microstructure manager
@@ -384,6 +391,7 @@ class DeepSeekAIStrategy(Strategy):
         # State tracking
         self.instrument: Optional[Instrument] = None
         self.last_signal: Optional[Dict[str, Any]] = None
+        self._last_llm_decision_bar_count: Optional[int] = None
         self.bars_received = 0
         self.dry_run = os.getenv("DRY_RUN", "false").strip().lower() == "true"
         self.llm_kline_context_bars = max(10, int(config.llm_kline_context_bars))
@@ -401,10 +409,15 @@ class DeepSeekAIStrategy(Strategy):
         if self.trade_journal_enabled:
             try:
                 self.trade_journal = TradeJournalCSV(self.trade_journal_path)
+                self.trade_journal_path = self.trade_journal.path
                 self.log.info(f"Decision trade journal enabled: {self.trade_journal_path}")
             except Exception as e:
                 self.trade_journal_enabled = False
                 self.log.warning(f"Failed to initialize trade journal: {e}")
+
+        self.enable_market_state_gate = config.enable_market_state_gate
+        self._last_llm_market_state: Optional[Dict[str, Any]] = None
+        self._force_next_llm_reason: Optional[str] = "startup"
 
         self.log.info(f"DeepSeek AI Strategy initialized for {self.instrument_id}")
         if self.dry_run:
@@ -819,8 +832,7 @@ class DeepSeekAIStrategy(Strategy):
             if self.enable_trailing_stop:
                 self._update_trailing_stops(last_px)
 
-        if self.enable_oco and self.oco_manager:
-            self._cleanup_oco_orphans()
+        self._cleanup_oco_orphans()
 
         if self.orderbook_manager and self.orderbook_manager.is_ready():
             try:
@@ -887,6 +899,17 @@ class DeepSeekAIStrategy(Strategy):
             'bar_type': str(self.bar_type),
         }
         price_data["bar_close_ts_utc"] = self._nanos_to_utc_iso(int(current_bar.ts_event))
+        if self._last_llm_decision_bar_count is None:
+            price_data["bars_since_last_llm_decision"] = None
+        else:
+            price_data["bars_since_last_llm_decision"] = max(
+                0,
+                self.bars_received - self._last_llm_decision_bar_count,
+            )
+        trade_margin_usdt = self.fixed_trade_usdt if self.fixed_trade_usdt > 0 else self.base_usdt
+        price_data["fixed_trade_margin_usdt"] = trade_margin_usdt
+        price_data["fixed_trade_notional_usdt"] = trade_margin_usdt * self.leverage
+        price_data["configured_leverage"] = self.leverage
 
         if microstructure_data:
             price_data["microstructure"] = microstructure_data
@@ -922,55 +945,48 @@ class DeepSeekAIStrategy(Strategy):
                 f"(source={current_position.get('source', 'nautilus')})"
             )
 
-        # --- Give-back protection circuit breaker ---
-        # If a profitable position has given back >60% of peak profit,
-        # auto-exit without consulting the LLM (saves latency + prevents further loss).
-        if current_position:
-            health = current_position.get("position_health") or {}
-            giveback = health.get("giveback_pct", 0)
-            peak_pnl = health.get("peak_unrealized_pnl", 0)
-            if peak_pnl > 5.0 and giveback > 60:
-                self.log.warning(
-                    f"🛡️ GIVE-BACK PROTECTION: peak uPnL was ${peak_pnl:.2f}, "
-                    f"now given back {giveback:.0f}%. Auto-closing position."
-                )
-                close_side = (
-                    OrderSide.SELL if current_position["side"] == "long" else OrderSide.BUY
-                )
-                qty = current_position["quantity"]
-                self._submit_order(side=close_side, quantity=qty, reduce_only=True)
+        market_state = self._build_market_state(
+            price_data=price_data,
+            technical_data=technical_data,
+            microstructure_data=microstructure_data,
+            current_position=current_position,
+            risk_context=risk_context,
+        )
+        price_data["market_state"] = market_state
 
-                gb_exec = {
-                    "status": "submitted",
-                    "action": "giveback_protection_exit",
-                    "target_side": "flat",
-                    "target_quantity": qty,
-                    "note": f"auto_exit_giveback_{giveback:.0f}pct_peak_{peak_pnl:.2f}",
-                }
-                fb = self.deepseek._emit_fallback(price_data)
-                fb["signal"] = "SELL" if current_position["side"] == "long" else "BUY"
-                fb["confidence"] = "HIGH"
-                fb["thesis"] = f"Give-back protection: peak uPnL ${peak_pnl:.2f}, gave back {giveback:.0f}%"
-                fb["reasoning_content"] = "circuit_breaker:giveback_protection"
-                self.last_signal = fb
+        should_call_llm, trigger_reason = self._should_call_llm(
+            market_state=market_state,
+            price_data=price_data,
+        )
+        price_data["llm_trigger_reason"] = trigger_reason
 
-                position_after = self._get_current_position_data()
-                self._append_trade_journal_row(
-                    signal_data=fb,
-                    price_data=price_data,
-                    technical_data=technical_data,
-                    microstructure_data=microstructure_data,
-                    risk_context=risk_context,
-                    current_position=current_position,
-                    position_after=position_after,
-                    execution_summary=gb_exec,
-                    bar_close_iso=price_data.get("bar_close_ts_utc"),
-                    execution_ts_iso=datetime.utcnow().isoformat(),
-                    decision_ts_iso=datetime.utcnow().isoformat(),
-                    latency_ms=0,
-                    decision_trigger="giveback_protection",
-                )
-                return
+        if not should_call_llm:
+            self.log.info(
+                "🧭 Market-state gate: previous LLM decision remains valid "
+                f"({trigger_reason})"
+            )
+            gated_signal = self._build_gated_signal(trigger_reason, market_state)
+            position_after_gate = self._get_current_position_data()
+            self._append_trade_journal_row(
+                signal_data=gated_signal,
+                price_data=price_data,
+                technical_data=technical_data,
+                microstructure_data=microstructure_data,
+                risk_context=risk_context,
+                current_position=current_position,
+                position_after=position_after_gate,
+                execution_summary={
+                    "status": "gated",
+                    "action": "none",
+                    "note": trigger_reason,
+                },
+                bar_close_iso=price_data.get("bar_close_ts_utc"),
+                execution_ts_iso=datetime.utcnow().isoformat(),
+                decision_ts_iso=datetime.utcnow().isoformat(),
+                latency_ms=0,
+                decision_trigger="market_state_gate",
+            )
+            return
 
         execution_summary = {"status": "error", "action": "none", "note": "pre_llm"}
 
@@ -979,7 +995,7 @@ class DeepSeekAIStrategy(Strategy):
         try:
             import time as _time
 
-            self.log.info("Calling DeepSeek AI (bar-aligned synthesis)...")
+            self.log.info(f"Calling DeepSeek AI (market-change trigger: {trigger_reason})...")
             _t0 = _time.monotonic()
             signal_data = self.deepseek.analyze(
                 price_data=price_data,
@@ -1019,6 +1035,9 @@ class DeepSeekAIStrategy(Strategy):
                         self.log.warning(f"Failed to send Telegram signal notification: {e}")
 
             self.last_signal = signal_data
+            self._record_llm_market_state(market_state)
+            self._last_llm_decision_bar_count = self.bars_received
+            self._force_next_llm_reason = None
 
             execution_summary = self._execute_trade(
                 signal_data, price_data, technical_data, current_position, risk_context
@@ -1075,6 +1094,7 @@ class DeepSeekAIStrategy(Strategy):
             )
             fb["_latency_ms"] = None
             self.last_signal = fb
+            self._force_next_llm_reason = "last_llm_error"
             pos_after_fail = self._get_current_position_data()
             tw = (microstructure_data or {}).get('tf_windows') or {}
             ob_fast_f = ""
@@ -1102,6 +1122,283 @@ class DeepSeekAIStrategy(Strategy):
                 ob_window_main_json=ob_main_f,
                 ob_window_context_json=ob_ctx_f,
             )
+
+    def _safe_float(self, value: Any, default: float = 0.0) -> float:
+        try:
+            if value is None:
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _bucket_signed(self, value: Any, weak: float = 0.15, strong: float = 0.45) -> str:
+        val = self._safe_float(value)
+        if val >= strong:
+            return "strong_buy"
+        if val >= weak:
+            return "buy"
+        if val <= -strong:
+            return "strong_sell"
+        if val <= -weak:
+            return "sell"
+        return "neutral"
+
+    def _bucket_rvol(self, value: Any) -> str:
+        val = self._safe_float(value, 1.0)
+        if val >= 2.0:
+            return "climactic"
+        if val >= 1.2:
+            return "elevated"
+        if val <= 0.7:
+            return "quiet"
+        return "normal"
+
+    def _bucket_bb_position(self, value: Any) -> str:
+        val = self._safe_float(value, 0.5)
+        if val >= 0.9:
+            return "above_upper"
+        if val >= 0.7:
+            return "upper_band"
+        if val <= 0.1:
+            return "below_lower"
+        if val <= 0.3:
+            return "lower_band"
+        return "middle"
+
+    def _app_regime_label(self, technical_data: Dict[str, Any]) -> str:
+        trend = str(technical_data.get("overall_trend") or "mixed")
+        adx = self._safe_float(technical_data.get("adx"))
+        dmi_dx = self._safe_float(technical_data.get("dmi_dx"))
+        trend_strength = max(adx, dmi_dx)
+        if trend == "strong_up" and trend_strength >= 20:
+            return "trend_up"
+        if trend == "strong_down" and trend_strength >= 20:
+            return "trend_down"
+        if trend == "mixed" or trend_strength < 18:
+            return "range_or_chop"
+        return "transition"
+
+    def _structure_state(
+        self,
+        price: float,
+        technical_data: Dict[str, Any],
+    ) -> str:
+        support = self._safe_float(technical_data.get("support"))
+        resistance = self._safe_float(technical_data.get("resistance"))
+        atr = self._safe_float(technical_data.get("atr"))
+        buffer = max(atr * 0.20, price * 0.0005)
+        if support > 0 and price < support - buffer:
+            return "below_support"
+        if resistance > 0 and price > resistance + buffer:
+            return "above_resistance"
+        if support > 0 and abs(price - support) <= buffer:
+            return "at_support"
+        if resistance > 0 and abs(price - resistance) <= buffer:
+            return "at_resistance"
+        return "inside_range"
+
+    def _extract_ob_label(self, microstructure_data: Optional[Dict[str, Any]], window: str, label: str) -> str:
+        tw = (microstructure_data or {}).get("tf_windows") or {}
+        node = tw.get(window) if isinstance(tw, dict) else None
+        labels = node.get("labels") if isinstance(node, dict) else None
+        return str((labels or {}).get(label) or "unknown")
+
+    def _build_market_state(
+        self,
+        price_data: Dict[str, Any],
+        technical_data: Dict[str, Any],
+        microstructure_data: Optional[Dict[str, Any]],
+        current_position: Optional[Dict[str, Any]],
+        risk_context: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        price = self._safe_float(price_data.get("price"))
+        atr = self._safe_float(technical_data.get("atr"))
+        position_side = str((current_position or {}).get("side") or "flat").lower()
+        position_qty = round(self._safe_float((current_position or {}).get("quantity")), 8)
+        open_orders_count = len((risk_context or {}).get("open_orders") or [])
+        main_pressure = self._extract_ob_label(microstructure_data, "main", "directional_pressure")
+        main_shift = self._extract_ob_label(microstructure_data, "main", "regime_shift")
+        tw = (microstructure_data or {}).get("tf_windows") or {}
+        main_node = tw.get("main") if isinstance(tw, dict) else None
+        main_trade_flow_imbalance = self._safe_float(
+            (main_node or {}).get("trade_flow_imbalance"),
+            self._safe_float((microstructure_data or {}).get("trade_flow_imbalance")),
+        )
+        main_normalized_ofi_score = self._safe_float(
+            (main_node or {}).get("normalized_ofi_score"),
+            self._safe_float((microstructure_data or {}).get("normalized_ofi_score")),
+        )
+        invalidation_price = self._extract_position_invalidation_price(
+            position=current_position,
+            current_price=price,
+        )
+
+        return {
+            "price": price,
+            "atr": atr,
+            "position_key": f"{position_side}:{position_qty}",
+            "open_orders_count": open_orders_count,
+            "has_pending_intent": open_orders_count > 0,
+            "app_regime": self._app_regime_label(technical_data),
+            "main_pressure": main_pressure,
+            "main_regime_shift": main_shift,
+            "main_trade_flow_imbalance": main_trade_flow_imbalance,
+            "main_normalized_ofi_score": main_normalized_ofi_score,
+            "position_invalidation_price": invalidation_price,
+            "support_12": self._safe_float(technical_data.get("support_12")),
+            "resistance_12": self._safe_float(technical_data.get("resistance_12")),
+            "support_48": self._safe_float(technical_data.get("support_48")),
+            "resistance_48": self._safe_float(technical_data.get("resistance_48")),
+            "support": self._safe_float(technical_data.get("support")),
+            "resistance": self._safe_float(technical_data.get("resistance")),
+        }
+
+    def _extract_position_invalidation_price(
+        self,
+        position: Optional[Dict[str, Any]],
+        current_price: float,
+    ) -> Optional[float]:
+        if not position:
+            return None
+        side = str(position.get("side") or "").lower()
+        if side not in {"long", "short"}:
+            return None
+        signal = self.last_signal or {}
+        candidates: List[float] = []
+        stop_loss = self._safe_float(signal.get("stop_loss"))
+        if stop_loss > 0:
+            candidates.append(stop_loss)
+        invalidation = str(signal.get("invalidation") or "")
+        for raw in re.findall(r"[-+]?[0-9]*\.?[0-9]+", invalidation):
+            level = self._safe_float(raw)
+            if level > 0:
+                candidates.append(level)
+        if not candidates:
+            return None
+        if side == "short":
+            above = [lvl for lvl in candidates if lvl >= current_price]
+            selected = min(above) if above else max(candidates)
+        else:
+            below = [lvl for lvl in candidates if lvl <= current_price]
+            selected = max(below) if below else min(candidates)
+        return selected if selected > 0 else None
+
+    @staticmethod
+    def _crossed_outside_band(previous_value: float, current_value: float, neutral_abs: float) -> bool:
+        return abs(previous_value) <= neutral_abs < abs(current_value)
+
+    @staticmethod
+    def _crossed_above_threshold(previous_value: float, current_value: float, threshold: float) -> bool:
+        return previous_value <= threshold < current_value
+
+    @staticmethod
+    def _crossed_below_threshold(previous_value: float, current_value: float, threshold: float) -> bool:
+        return previous_value >= threshold > current_value
+
+    def _should_call_llm(
+        self,
+        market_state: Dict[str, Any],
+        price_data: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        if not self.enable_market_state_gate:
+            return True, "market_state_gate_disabled"
+        force_reason = str(self._force_next_llm_reason or "")
+        if force_reason in {"startup", "last_llm_error"}:
+            return True, "startup_or_recovery"
+        if force_reason:
+            return True, force_reason
+        if not self.last_signal or self.last_signal.get("is_fallback"):
+            return True, "startup_or_recovery"
+        previous = self._last_llm_market_state
+        if not previous:
+            return True, "startup_or_recovery"
+
+        if (
+            market_state.get("open_orders_count") != previous.get("open_orders_count")
+            or (
+                bool(previous.get("has_pending_intent"))
+                and not bool(market_state.get("has_pending_intent"))
+            )
+            or market_state.get("position_key") != previous.get("position_key")
+        ):
+            return True, "pending_intent_state_changed"
+
+        price = self._safe_float(market_state.get("price"))
+        last_price = self._safe_float(previous.get("price"))
+        atr = self._safe_float(market_state.get("atr"))
+        cross_buffer = max(0.15 * atr, price * 0.0005) if atr > 0 and price > 0 else 0.0
+
+        if cross_buffer > 0:
+            for support_key, resistance_key in (("support_12", "resistance_12"), ("support_48", "resistance_48")):
+                support = self._safe_float(previous.get(support_key))
+                resistance = self._safe_float(previous.get(resistance_key))
+                if resistance > 0 and self._crossed_above_threshold(
+                    last_price,
+                    price,
+                    resistance + cross_buffer,
+                ):
+                    return True, "structure_cross"
+                if support > 0 and self._crossed_below_threshold(
+                    last_price,
+                    price,
+                    support - cross_buffer,
+                ):
+                    return True, "structure_cross"
+
+        position_key = str(market_state.get("position_key") or "flat:0")
+        in_position = not position_key.startswith("flat:")
+        invalidation_price = self._safe_float(market_state.get("position_invalidation_price"))
+        if in_position and invalidation_price > 0 and atr > 0:
+            side = "short" if position_key.startswith("short:") else "long"
+            if side == "short" and price >= (invalidation_price - 0.15 * atr):
+                return True, "position_invalidation_threat"
+            if side == "long" and price <= (invalidation_price + 0.15 * atr):
+                return True, "position_invalidation_threat"
+
+        tfi_prev = self._safe_float(previous.get("main_trade_flow_imbalance"))
+        tfi_now = self._safe_float(market_state.get("main_trade_flow_imbalance"))
+        if self._crossed_outside_band(tfi_prev, tfi_now, 0.15):
+            return True, "micro_numeric_cross"
+        ofi_prev = self._safe_float(previous.get("main_normalized_ofi_score"))
+        ofi_now = self._safe_float(market_state.get("main_normalized_ofi_score"))
+        if self._crossed_outside_band(ofi_prev, ofi_now, 0.20):
+            return True, "micro_numeric_cross"
+
+        prev_shift = str(previous.get("main_regime_shift") or "unknown")
+        now_shift = str(market_state.get("main_regime_shift") or "unknown")
+        if (prev_shift == "transitioning") != (now_shift == "transitioning"):
+            return True, "hard_regime_flip"
+
+        return False, "no_material_market_change"
+
+    def _record_llm_market_state(self, market_state: Dict[str, Any]) -> None:
+        self._last_llm_market_state = dict(market_state)
+
+    def _build_gated_signal(self, trigger_reason: str, market_state: Dict[str, Any]) -> Dict[str, Any]:
+        previous = self.last_signal or {}
+        thesis = previous.get("thesis") or previous.get("reason") or ""
+        return {
+            "signal": "HOLD",
+            "position_action": (
+                "NO_ACTION"
+                if str(market_state.get("position_key") or "flat:0").startswith("flat:")
+                else "HOLD_POSITION"
+            ),
+            "confidence": previous.get("confidence", "LOW"),
+            "regime": market_state.get("app_regime", previous.get("regime", "")),
+            "trend_strength": previous.get("trend_strength", ""),
+            "risk_assessment": previous.get("risk_assessment", ""),
+            "reason": "Market-state gate: prior LLM decision still valid.",
+            "thesis": thesis or "No material regime, structure, volume, or order-book change.",
+            "invalidation": previous.get("invalidation", ""),
+            "execution_note": trigger_reason,
+            "volume_note": previous.get("volume_note", ""),
+            "reasoning_content": f"market_state_gate:{trigger_reason}",
+            "llm_model": getattr(self.deepseek, "model", ""),
+            "llm_api_seconds": "",
+            "is_gated": True,
+            "market_state": market_state,
+        }
 
     def _calculate_price_change(self) -> float:
         """Calculate price change percentage."""
@@ -1143,6 +1440,7 @@ class DeepSeekAIStrategy(Strategy):
         micro = microstructure_data or {}
         position_before = current_position or {}
         execution = execution_summary or {}
+        bracket_plan = execution.get("bracket_plan") or {}
 
         tw = micro.get("tf_windows") or {}
         if ob_window_fast_json is None and isinstance(tw, dict) and tw.get("ready"):
@@ -1181,6 +1479,7 @@ class DeepSeekAIStrategy(Strategy):
             "bar_ts_event": price_data.get("bar_ts_event"),
             "bar_ts_init": price_data.get("bar_ts_init"),
             "signal": signal_data.get("signal"),
+            "position_action": signal_data.get("position_action"),
             "confidence": signal_data.get("confidence"),
             "trend_strength": signal_data.get("trend_strength"),
             "risk_assessment": signal_data.get("risk_assessment"),
@@ -1229,6 +1528,9 @@ class DeepSeekAIStrategy(Strategy):
             "execution_target_side": execution.get("target_side"),
             "execution_target_quantity": execution.get("target_quantity"),
             "execution_note": execution.get("note"),
+            "bracket_levels_source": bracket_plan.get("levels_source"),
+            "bracket_stop_loss": bracket_plan.get("stop_loss_price"),
+            "bracket_take_profit": bracket_plan.get("take_profit_price"),
             "technical_snapshot_json": technical_data,
             "microstructure_snapshot_json": micro,
             "risk_context_json": risk_context,
@@ -1393,15 +1695,15 @@ class DeepSeekAIStrategy(Strategy):
 
         bars_held = max(0, self.bars_received - self._position_health["entry_bar_count"])
 
-        recommendation = "hold"
-        if giveback_pct > 60:
-            recommendation = "exit_now"
-        elif giveback_pct > 40:
-            recommendation = "consider_exit"
-        elif profit_pct > 0.3:
-            recommendation = "consider_taking_profit"
-        elif profit_pct < -0.5:
-            recommendation = "consider_cutting_loss"
+        recommendation = "stable"
+        if profit_pct < 0:
+            recommendation = "underwater"
+        elif giveback_pct >= 60:
+            recommendation = "deep_giveback"
+        elif giveback_pct >= 30:
+            recommendation = "minor_giveback"
+        elif profit_pct >= 0.4:
+            recommendation = "extended_profit"
 
         position_data["position_health"] = {
             "profit_pct": round(profit_pct, 4),
@@ -1535,7 +1837,7 @@ class DeepSeekAIStrategy(Strategy):
         """
         # Check if trading is paused
         if self.is_trading_paused:
-            self.log.info("⏸️ Trading is paused - skipping signal execution")
+            self._log_info_safe("⏸️ Trading is paused - skipping signal execution")
             return {"status": "skipped", "action": "none", "note": "trading_paused"}
         
         # Store signal and technical data for SL/TP calculation
@@ -1543,16 +1845,73 @@ class DeepSeekAIStrategy(Strategy):
         self.latest_technical_data = technical_data
         self.latest_price_data = price_data
         
-        signal = signal_data['signal']
-        confidence = signal_data['confidence']
+        action = str(signal_data.get("position_action") or "NO_ACTION").upper()
+        confidence = str(signal_data.get('confidence') or 'LOW').upper()
 
-        # Check minimum confidence
+        valid_actions = {
+            "ENTER_LONG",
+            "ENTER_SHORT",
+            "HOLD_POSITION",
+            "EXIT_NOW",
+            "NO_ACTION",
+        }
+        if action not in valid_actions:
+            self._log_warning_safe(f"⚠️ Invalid position_action={action}; taking no action")
+            return {"status": "skipped", "action": "none", "note": f"invalid_position_action:{action}"}
+
+        if current_position:
+            current_side = str(current_position.get("side") or "").lower()
+            current_qty = float(current_position.get("quantity") or 0.0)
+
+            if action == "EXIT_NOW":
+                exit_side = OrderSide.SELL if current_side == "long" else OrderSide.BUY
+                self._submit_order(side=exit_side, quantity=current_qty, reduce_only=True)
+                self.log.info(
+                    f"🛡️ LLM EXIT_NOW: closing {current_side} {current_qty:.6g} "
+                    f"{self.base_asset} with one reduce-only order"
+                )
+                return {
+                    "status": "submitted",
+                    "action": "exit_now",
+                    "target_side": "flat",
+                    "target_quantity": 0.0,
+                    "note": "llm_exit_now_reduce_only",
+                }
+
+            if action in {"HOLD_POSITION", "NO_ACTION"}:
+                self._log_info_safe(f"📊 Action: {action} - retaining current position")
+                return {
+                    "status": "hold",
+                    "action": "hold_position",
+                    "target_side": current_side,
+                    "target_quantity": current_qty,
+                    "note": action.lower(),
+                }
+
+            self._log_warning_safe(
+                f"⚠️ Ignoring {action} while {current_side} position is open; "
+                "close first and wait for a later flat-state entry decision"
+            )
+            return {
+                "status": "skipped",
+                "action": "hold_position",
+                "target_side": current_side,
+                "target_quantity": current_qty,
+                "note": f"entry_action_while_exposed:{action}",
+            }
+
+        if action in {"NO_ACTION", "HOLD_POSITION", "EXIT_NOW"}:
+            self._log_info_safe(f"📊 Action: {action} while flat - no action taken")
+            return {"status": "hold", "action": "none", "note": f"flat_{action.lower()}"}
+
+        # Confidence gating applies to new exposure only. EXIT_NOW above always
+        # remains available as a risk-reducing action.
         confidence_levels = {'LOW': 0, 'MEDIUM': 1, 'HIGH': 2}
         min_conf_level = confidence_levels.get(self.min_confidence, 1)
         signal_conf_level = confidence_levels.get(confidence, 1)
 
         if signal_conf_level < min_conf_level:
-            self.log.warning(
+            self._log_warning_safe(
                 f"⚠️ Signal confidence {confidence} below minimum {self.min_confidence}, skipping trade"
             )
             return {
@@ -1561,107 +1920,25 @@ class DeepSeekAIStrategy(Strategy):
                 "note": f"confidence_below_min:{confidence}<{self.min_confidence}",
             }
 
-        partial_execution = self._apply_partial_close_from_signal(
-            signal_data=signal_data,
-            current_position=current_position,
-        )
-        if partial_execution is not None:
-            return partial_execution
-
-        # Handle HOLD signal
-        if signal == 'HOLD':
-            self.log.info("📊 Signal: HOLD - No action taken")
-            return {"status": "hold", "action": "none", "note": "hold_signal"}
-
         # Calculate target position size
         target_quantity = self._calculate_position_size(
             signal_data, price_data, technical_data, current_position, risk_context
         )
 
         if target_quantity == 0:
-            self.log.warning("⚠️ Calculated position size is 0, skipping trade")
+            self._log_warning_safe("⚠️ Calculated position size is 0, skipping trade")
             return {"status": "skipped", "action": "none", "note": "zero_target_quantity"}
 
-        # Determine order side
-        target_side = 'long' if signal == 'BUY' else 'short'
-
-        # Execute position management logic
-        if current_position:
-            self._manage_existing_position(
-                current_position, target_side, target_quantity, confidence
-            )
-            return {
-                "status": "submitted",
-                "action": "manage_existing",
-                "target_side": target_side,
-                "target_quantity": target_quantity,
-                "note": "order_logic_dispatched",
-            }
-        else:
-            self._open_new_position(target_side, target_quantity)
-            return {
-                "status": "submitted",
-                "action": "open_new",
-                "target_side": target_side,
-                "target_quantity": target_quantity,
-                "note": "order_logic_dispatched",
-            }
-
-    def _apply_partial_close_from_signal(
-        self,
-        signal_data: Dict[str, Any],
-        current_position: Optional[Dict[str, Any]],
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Execute partial position reduction when LLM provides partial_close_pct.
-
-        Works for both:
-        - HOLD + partial_close_pct (scale out while holding bias)
-        - Opposite bias + partial_close_pct (reduce existing exposure, avoid full reversal)
-        """
-        if not current_position:
-            return None
-
-        raw = signal_data.get("partial_close_pct")
-        if raw is None:
-            return None
-
-        try:
-            pct = float(raw)
-        except (TypeError, ValueError):
-            self.log.warning("⚠️ Ignoring invalid partial_close_pct from LLM")
-            return None
-
-        if pct <= 0:
-            return None
-        pct = min(1.0, pct)
-
-        current_qty = float(current_position.get("quantity") or 0.0)
-        if current_qty <= 0:
-            return None
-
-        reduce_qty = self._normalize_order_quantity(current_qty * pct)
-        if reduce_qty is None:
-            return {
-                "status": "skipped",
-                "action": "partial_close",
-                "note": "partial_close_qty_below_increment",
-            }
-
-        reduce_qty = min(reduce_qty, current_qty)
-        exit_side = (
-            OrderSide.SELL if current_position.get("side") == "long" else OrderSide.BUY
-        )
-        self._submit_order(side=exit_side, quantity=reduce_qty, reduce_only=True)
-        self.log.info(
-            f"✂️ Partial close from LLM: pct={pct:.2f}, qty={reduce_qty:.6g}/{current_qty:.6g} {self.base_asset}"
-        )
+        target_side = "long" if action == "ENTER_LONG" else "short"
+        result = self._open_new_position(target_side, target_quantity)
+        if result:
+            return result
         return {
-            "status": "submitted",
-            "action": "partial_close",
-            "target_side": current_position.get("side"),
-            "target_quantity": max(0.0, current_qty - reduce_qty),
-            "note": f"partial_close_pct:{pct:.4f}",
+            "status": "skipped",
+            "action": "open_new",
+            "target_side": target_side,
+            "target_quantity": target_quantity,
+            "note": "bracket_order_not_submitted",
         }
 
     def _calculate_position_size(
@@ -1673,41 +1950,13 @@ class DeepSeekAIStrategy(Strategy):
         risk_context: Optional[Dict[str, Any]] = None,
     ) -> float:
         """
-        Calculate intelligent position size.
+        Calculate fixed-margin position size.
 
-        Returns BTC quantity based on confidence, trend, and RSI.
+        Configured USDT is margin capital. Effective order notional is
+        margin * configured leverage. Confidence/trend no longer scale entries.
         """
-        # Treat fixed_trade_usdt as the base target, but still vary exposure by
-        # confidence and risk conditions. This prevents the LLM confidence field
-        # from being ignored during live/demo operation.
-        base_usdt = self.fixed_trade_usdt if self.fixed_trade_usdt > 0 else self.base_usdt
-
-        # Confidence multiplier
-        conf_mult = self.position_config.get(
-            f"{signal_data['confidence'].lower()}_confidence_multiplier",
-            1.0
-        )
-
-        # Trend multiplier
-        trend = technical_data.get('overall_trend', 'mixed')
-        trend_mult = (
-            self.position_config['trend_strength_multiplier']
-            if trend in ['strong_up', 'strong_down']
-            else 1.0
-        )
-
-        # RSI multiplier (reduce size in extreme RSI)
-        rsi = technical_data.get('rsi', 50)
-        rsi_mult = (
-            self.rsi_extreme_mult
-            if rsi > self.rsi_extreme_upper or rsi < self.rsi_extreme_lower
-            else 1.0
-        )
-
-        suggested_usdt = base_usdt * conf_mult * trend_mult * rsi_mult
-        sizing_reason = (
-            f"Base:{base_usdt} × Conf:{conf_mult} × Trend:{trend_mult} × RSI:{rsi_mult}"
-        )
+        requested_margin_usdt = self.fixed_trade_usdt if self.fixed_trade_usdt > 0 else self.base_usdt
+        requested_usdt = requested_margin_usdt * self.leverage
 
         # Apply max position ratio limit
         account_equity = self._account_equity_for_sizing(risk_context)
@@ -1715,7 +1964,13 @@ class DeepSeekAIStrategy(Strategy):
         max_usdt = account_equity * self.position_config['max_position_ratio']
         if available_balance is not None and available_balance > 0:
             max_usdt = min(max_usdt, available_balance * self.leverage * 0.95)
-        final_usdt = min(suggested_usdt, max_usdt)
+        final_usdt = min(requested_usdt, max_usdt)
+        sizing_reason = (
+            f"Fixed margin request:${requested_margin_usdt:.2f} "
+            f"x {self.leverage:.2f}x = notional:${requested_usdt:.2f}"
+        )
+        if final_usdt < requested_usdt:
+            sizing_reason += f", capped:${final_usdt:.2f}"
 
         # Enforce a conservative minimum notional requirement.
         MIN_NOTIONAL_USDT = 100.0
@@ -1796,109 +2051,30 @@ class DeepSeekAIStrategy(Strategy):
             return None
         return normalized_float
 
-    def _manage_existing_position(
-        self,
-        current_position: Dict[str, Any],
-        target_side: str,
-        target_quantity: float,
-        confidence: str,
-    ):
-        """Manage existing position (add, reduce, or reverse)."""
-        current_side = current_position['side']
-        current_qty = current_position['quantity']
-
-        # Same direction - adjust position
-        if target_side == current_side:
-            size_diff = target_quantity - current_qty
-            threshold = self._position_adjustment_threshold()
-
-            if abs(size_diff) < threshold:
-                self.log.info(
-                    f"✅ Position size appropriate ({current_qty:.6g} {self.base_asset}), no adjustment needed"
-                )
-                return
-
-            order_quantity = self._normalize_order_quantity(abs(size_diff))
-            if order_quantity is None:
-                return
-
-            if size_diff > 0:
-                # Add to position
-                self._submit_order(
-                    side=OrderSide.BUY if target_side == 'long' else OrderSide.SELL,
-                    quantity=order_quantity,
-                    reduce_only=False,
-                )
-                self.log.info(
-                    f"📈 Adding to {target_side} position: {order_quantity:.6g} {self.base_asset} "
-                    f"({current_qty:.6g} → {target_quantity:.6g})"
-                )
-            else:
-                # Reduce position
-                self._submit_order(
-                    side=OrderSide.SELL if target_side == 'long' else OrderSide.BUY,
-                    quantity=order_quantity,
-                    reduce_only=True,
-                )
-                self.log.info(
-                    f"📉 Reducing {target_side} position: {order_quantity:.6g} {self.base_asset} "
-                    f"({current_qty:.6g} → {target_quantity:.6g})"
-                )
-
-        # Opposite direction - reverse position
-        elif self.allow_reversals:
-            # Check if high confidence required for reversal
-            if self.require_high_conf_reversal and confidence != 'HIGH':
-                self.log.warning(
-                    f"🔒 Reversal requires HIGH confidence, got {confidence}. "
-                    f"Keeping {current_side} position."
-                )
-                return
-
-            self.log.info(f"🔄 Reversing position: {current_side} → {target_side}")
-
-            # Close current position
-            self._submit_order(
-                side=OrderSide.SELL if current_side == 'long' else OrderSide.BUY,
-                quantity=current_qty,
-                reduce_only=True,
-            )
-
-            # Open opposite position
-            self._submit_order(
-                side=OrderSide.BUY if target_side == 'long' else OrderSide.SELL,
-                quantity=target_quantity,
-                reduce_only=False,
-            )
-
-        else:
-            self.log.warning(
-                f"⚠️ Signal suggests {target_side} but have {current_side} position. "
-                f"Reversals disabled."
-            )
-
     def _open_new_position(self, side: str, quantity: float):
         """
-        Open new position using bracket order (entry + SL + TP).
+        Open new position using a structural bracket order (entry + SL + TP).
 
-        This method submits a bracket order which automatically includes:
-        - Entry order (MARKET)
-        - Stop Loss order (STOP_MARKET)
-        - Take Profit order(s) (LIMIT)
+        Delegates to ``_submit_bracket_order``, which uses:
+        - Entry: LIMIT post-only at estimated bar close (may not fill immediately)
+        - Stop loss: STOP_MARKET at structural invalidation (support/resistance)
+        - Take profit: LIMIT at nearest viable structural target (min R:R gate)
 
-        The SL and TP orders are linked with OCO, so when one fills, the others cancel.
+        EXIT_NOW uses ``_submit_order`` (MARKET, reduce-only) in v1.
         """
         order_side = OrderSide.BUY if side == 'long' else OrderSide.SELL
 
         # Submit bracket order with SL/TP
-        self._submit_bracket_order(
+        bracket_result = self._submit_bracket_order(
             side=order_side,
             quantity=quantity,
         )
 
-        self.log.info(
-            f"🚀 Opening {side} position: {quantity:.6g} {self.base_asset} (with bracket SL/TP)"
-        )
+        if bracket_result and bracket_result.get("status") == "submitted":
+            self.log.info(
+                f"🚀 Opening {side} position: {quantity:.6g} {self.base_asset} (with bracket SL/TP)"
+            )
+        return bracket_result
 
     def _submit_order(
         self,
@@ -1952,7 +2128,7 @@ class DeepSeekAIStrategy(Strategy):
         Submit a bracket order with entry, stop loss, and take profit using NautilusTrader's built-in bracket orders.
 
         This uses the OrderFactory.bracket() method which automatically creates:
-        - Entry order (MARKET)
+        - Entry order (LIMIT, post-only where supported)
         - Stop Loss order (STOP_MARKET) linked with OTO (One-Triggers-Other)
         - Take Profit order (LIMIT) linked with OTO and OCO with SL
 
@@ -1967,7 +2143,11 @@ class DeepSeekAIStrategy(Strategy):
         """
         normalized_quantity = self._normalize_order_quantity(quantity)
         if normalized_quantity is None:
-            return
+            return {
+                "status": "skipped",
+                "action": "open_new",
+                "note": "quantity_below_increment",
+            }
         quantity = normalized_quantity
 
         if quantity < self.position_config['min_trade_amount']:
@@ -1975,24 +2155,32 @@ class DeepSeekAIStrategy(Strategy):
                 f"⚠️ Order quantity {quantity:.6g} below minimum "
                 f"{self.position_config['min_trade_amount']:.6g}, skipping"
             )
-            return
-
-        if self._is_dry_run():
-            self.log.info(
-                f"🧪 DRY RUN: Simulated bracket order {side.name} {quantity:.6g} {self.base_asset} "
-                f"(entry + SL + TP not submitted)"
-            )
-            return
+            return {
+                "status": "skipped",
+                "action": "open_new",
+                "target_quantity": quantity,
+                "note": "quantity_below_min_trade_amount",
+            }
 
         if not self.enable_auto_sl_tp:
-            self.log.warning("⚠️ Auto SL/TP is disabled - submitting simple market order instead")
-            self._submit_order(side=side, quantity=quantity, reduce_only=False)
-            return
+            self.log.error("❌ Auto SL/TP is disabled - blocking unprotected entry")
+            return {
+                "status": "skipped",
+                "action": "open_new",
+                "target_side": "long" if side == OrderSide.BUY else "short",
+                "target_quantity": quantity,
+                "note": "auto_sl_tp_disabled_entry_blocked",
+            }
 
-        if not self.latest_signal_data or not self.latest_technical_data:
-            self.log.warning("⚠️ No signal/technical data available for SL/TP - submitting simple market order")
-            self._submit_order(side=side, quantity=quantity, reduce_only=False)
-            return
+        if not self.latest_signal_data:
+            self.log.error("❌ No signal data available for SL/TP - blocking unprotected entry")
+            return {
+                "status": "skipped",
+                "action": "open_new",
+                "target_side": "long" if side == OrderSide.BUY else "short",
+                "target_quantity": quantity,
+                "note": "missing_signal_entry_blocked",
+            }
 
         # Determine latest price for entry estimation
         entry_price: Optional[float] = None
@@ -2011,50 +2199,47 @@ class DeepSeekAIStrategy(Strategy):
                 entry_price = float(cache_bars[-1].close)
 
         if entry_price is None or entry_price <= 0:
-            self.log.error("❌ Unable to determine entry price for bracket order, submitting market order instead")
-            self._submit_order(side=side, quantity=quantity, reduce_only=False)
-            return
+            self.log.error("❌ Unable to determine entry price for bracket order - blocking unprotected entry")
+            return {
+                "status": "skipped",
+                "action": "open_new",
+                "target_side": "long" if side == OrderSide.BUY else "short",
+                "target_quantity": quantity,
+                "note": "entry_price_missing_entry_blocked",
+            }
 
-        # Get confidence and technical data
         confidence = self.latest_signal_data.get('confidence', 'MEDIUM')
-        support = self.latest_technical_data.get('support', 0.0)
-        resistance = self.latest_technical_data.get('resistance', 0.0)
 
-        # Calculate Stop Loss price
-        if side == OrderSide.BUY:
-            # BUY: Stop loss below support
-            if self.sl_use_support_resistance and support > 0:
-                stop_loss_price = support * (1 - self.sl_buffer_pct)
-                self.log.info(f"📍 Using support level for SL: ${support:,.2f} → ${stop_loss_price:,.2f}")
-            else:
-                stop_loss_price = entry_price * 0.98  # Default 2% below entry
-                self.log.info(f"📍 Using default 2% SL: ${stop_loss_price:,.2f}")
-        else:
-            # SELL: Stop loss above resistance
-            if self.sl_use_support_resistance and resistance > 0:
-                stop_loss_price = resistance * (1 + self.sl_buffer_pct)
-                self.log.info(f"📍 Using resistance level for SL: ${resistance:,.2f} → ${stop_loss_price:,.2f}")
-            else:
-                stop_loss_price = entry_price * 1.02  # Default 2% above entry
-                self.log.info(f"📍 Using default 2% SL: ${stop_loss_price:,.2f}")
+        bracket_plan = self._build_entry_bracket_plan(side, entry_price, quantity)
 
-        # Calculate Take Profit price (use first level for bracket order)
-        # Note: Bracket orders support single TP. For multiple TPs, we'll submit additional orders after entry fills
-        tp_pct = self.tp_pct_config.get(confidence, 0.02)
-        if side == OrderSide.BUY:
-            tp_price = entry_price * (1 + tp_pct)
-        else:
-            tp_price = entry_price * (1 - tp_pct)
+        stop_loss_price = bracket_plan["stop_loss_price"]
+        tp_price = bracket_plan["take_profit_price"]
 
         # Log SL/TP summary
         self.log.info(
             f"🎯 Creating bracket order for {side.name}:\n"
-            f"   Entry: ~${entry_price:,.2f} (MARKET)\n"
+            f"   Entry: ${entry_price:,.2f} (LIMIT, post-only where supported)\n"
             f"   Stop Loss: ${stop_loss_price:,.2f} ({((stop_loss_price/entry_price - 1) * 100):.2f}%)\n"
             f"   Take Profit: ${tp_price:,.2f} ({((tp_price/entry_price - 1) * 100):.2f}%)\n"
+            f"   R:R: {bracket_plan['rr']:.2f}R levels_source={bracket_plan['levels_source']}\n"
+            f"   1R risk: ${bracket_plan['risk_usdt']:.2f} on ${bracket_plan['notional_usdt']:.2f} notional\n"
             f"   Quantity: {quantity:.6g} {self.base_asset}\n"
             f"   Confidence: {confidence}"
         )
+
+        if self._is_dry_run():
+            self.log.info(
+                f"🧪 DRY RUN: Simulated protected bracket {side.name} {quantity:.6g} {self.base_asset} "
+                f"(SL={stop_loss_price:.6g}, TP={tp_price:.6g}, source={bracket_plan['levels_source']})"
+            )
+            return {
+                "status": "submitted",
+                "action": "open_new",
+                "target_side": "long" if side == OrderSide.BUY else "short",
+                "target_quantity": quantity,
+                "note": f"dry_run_protected_bracket:{bracket_plan['levels_source']}",
+                "bracket_plan": bracket_plan,
+            }
 
         try:
             # Create bracket order using OrderFactory
@@ -2065,6 +2250,9 @@ class DeepSeekAIStrategy(Strategy):
                 instrument_id=self.instrument_id,
                 order_side=side,
                 quantity=self.instrument.make_qty(quantity),
+                entry_order_type=OrderType.LIMIT,
+                entry_price=self.instrument.make_price(entry_price),
+                entry_post_only=True,
                 sl_trigger_price=self.instrument.make_price(stop_loss_price),
                 tp_price=self.instrument.make_price(tp_price),
                 time_in_force=TimeInForce.GTC,
@@ -2105,10 +2293,224 @@ class DeepSeekAIStrategy(Strategy):
                         f"📌 Saved SL order ID for trailing stop: {str(sl_order.client_order_id)[:8]}..."
                     )
 
+            return {
+                "status": "submitted",
+                "action": "open_new",
+                "target_side": "long" if side == OrderSide.BUY else "short",
+                "target_quantity": quantity,
+                "note": (
+                    f"limit_bracket_rr:{bracket_plan['rr']:.2f} "
+                    f"risk_usdt:{bracket_plan['risk_usdt']:.2f} "
+                    f"levels_source:{bracket_plan['levels_source']}"
+                ),
+                "bracket_plan": bracket_plan,
+            }
+
         except Exception as e:
             self.log.error(f"❌ Failed to submit bracket order: {e}")
-            self.log.warning("⚠️ Falling back to simple market order without SL/TP")
-            self._submit_order(side=side, quantity=quantity, reduce_only=False)
+            self.log.error("❌ Blocking entry because protected bracket submission failed")
+            return {
+                "status": "skipped",
+                "action": "open_new",
+                "target_side": "long" if side == OrderSide.BUY else "short",
+                "target_quantity": quantity,
+                "note": f"protected_bracket_submission_failed:{type(e).__name__}",
+            }
+
+    def _build_entry_bracket_plan(
+        self,
+        side: OrderSide,
+        entry_price: float,
+        quantity: float,
+    ) -> Dict[str, Any]:
+        """Choose protected entry levels: LLM, structural, then symmetric 1%."""
+        llm_plan = self._build_llm_bracket_plan(side, entry_price, quantity)
+        if llm_plan is not None:
+            return llm_plan
+
+        structural_plan = self._build_structural_bracket_plan(side, entry_price, quantity)
+        if structural_plan["valid"]:
+            structural_plan["levels_source"] = "structural"
+            return structural_plan
+
+        return self._build_fallback_bracket_plan(side, entry_price, quantity)
+
+    def _build_llm_bracket_plan(
+        self,
+        side: OrderSide,
+        entry_price: float,
+        quantity: float,
+    ) -> Optional[Dict[str, Any]]:
+        """Return validated LLM TP/SL levels, or None when fallback is required."""
+        signal = self.latest_signal_data or {}
+        try:
+            stop_loss_price = float(signal.get("stop_loss"))
+            tp_price = float(signal.get("take_profit"))
+        except (TypeError, ValueError):
+            return None
+
+        if side == OrderSide.BUY:
+            risk_per_unit = entry_price - stop_loss_price
+            reward_per_unit = tp_price - entry_price
+        else:
+            risk_per_unit = stop_loss_price - entry_price
+            reward_per_unit = entry_price - tp_price
+        if risk_per_unit <= 0 or reward_per_unit <= 0:
+            return None
+
+        rr = reward_per_unit / risk_per_unit
+        if rr < self.min_entry_rr:
+            return None
+
+        return {
+            "valid": True,
+            "note": "ok",
+            "entry_price": entry_price,
+            "stop_loss_price": stop_loss_price,
+            "take_profit_price": tp_price,
+            "levels_source": "llm",
+            "target_source": "llm",
+            "target_r": rr,
+            "rr": rr,
+            "risk_pct": (risk_per_unit / entry_price) * 100.0,
+            "reward_pct": (reward_per_unit / entry_price) * 100.0,
+            "risk_usdt": risk_per_unit * quantity,
+            "notional_usdt": entry_price * quantity,
+            "candidates": [],
+        }
+
+    def _build_fallback_bracket_plan(
+        self,
+        side: OrderSide,
+        entry_price: float,
+        quantity: float,
+    ) -> Dict[str, Any]:
+        """Return the final symmetric 1% protected bracket fallback."""
+        if side == OrderSide.BUY:
+            stop_loss_price = entry_price * 0.99
+            tp_price = entry_price * 1.01
+        else:
+            stop_loss_price = entry_price * 1.01
+            tp_price = entry_price * 0.99
+        risk_per_unit = abs(entry_price - stop_loss_price)
+        reward_per_unit = abs(tp_price - entry_price)
+        return {
+            "valid": True,
+            "note": "ok",
+            "entry_price": entry_price,
+            "stop_loss_price": stop_loss_price,
+            "take_profit_price": tp_price,
+            "levels_source": "fallback_1pct",
+            "target_source": "fallback_1pct",
+            "target_r": 1.0,
+            "rr": 1.0,
+            "risk_pct": 1.0,
+            "reward_pct": 1.0,
+            "risk_usdt": risk_per_unit * quantity,
+            "notional_usdt": entry_price * quantity,
+            "candidates": [],
+        }
+
+    def _target_r_from_signal(self) -> float:
+        raw = (self.latest_signal_data or {}).get("target_r")
+        try:
+            target_r = float(raw)
+        except (TypeError, ValueError):
+            target_r = float(self.default_target_r)
+        return min(max(target_r, self.min_entry_rr), self.max_target_r)
+
+    def _structural_target_candidates(self, side: OrderSide, entry_price: float) -> List[Tuple[str, float]]:
+        tech = self.latest_technical_data or {}
+        if side == OrderSide.BUY:
+            keys = ("resistance_12", "resistance", "resistance_48", "resistance_288")
+            return [
+                (key, float(tech.get(key) or 0.0))
+                for key in keys
+                if float(tech.get(key) or 0.0) > entry_price
+            ]
+        keys = ("support_12", "support", "support_48", "support_288")
+        return [
+            (key, float(tech.get(key) or 0.0))
+            for key in keys
+            if 0.0 < float(tech.get(key) or 0.0) < entry_price
+        ]
+
+    def _build_structural_bracket_plan(
+        self,
+        side: OrderSide,
+        entry_price: float,
+        quantity: float,
+    ) -> Dict[str, Any]:
+        tech = self.latest_technical_data or {}
+        support = float(tech.get("support") or 0.0)
+        resistance = float(tech.get("resistance") or 0.0)
+        if side == OrderSide.BUY:
+            stop_loss_price = (
+                support * (1 - self.sl_buffer_pct)
+                if self.sl_use_support_resistance and support > 0
+                else entry_price * 0.98
+            )
+            risk_per_unit = entry_price - stop_loss_price
+            direction = 1.0
+        else:
+            stop_loss_price = (
+                resistance * (1 + self.sl_buffer_pct)
+                if self.sl_use_support_resistance and resistance > 0
+                else entry_price * 1.02
+            )
+            risk_per_unit = stop_loss_price - entry_price
+            direction = -1.0
+
+        if risk_per_unit <= 0:
+            return {
+                "valid": False,
+                "note": "invalid_stop_geometry",
+                "entry_price": entry_price,
+                "stop_loss_price": stop_loss_price,
+            }
+
+        target_r = self._target_r_from_signal()
+        min_reward = self.min_entry_rr * risk_per_unit
+        desired_reward = target_r * risk_per_unit
+        candidates = []
+        for source, target in self._structural_target_candidates(side, entry_price):
+            reward = (target - entry_price) * direction
+            if reward <= 0:
+                continue
+            candidates.append((source, target, reward / risk_per_unit, reward))
+
+        viable = [c for c in candidates if c[3] >= min_reward]
+        if not viable:
+            return {
+                "valid": False,
+                "note": f"no_structural_target_with_min_rr:{self.min_entry_rr:.2f}",
+                "entry_price": entry_price,
+                "stop_loss_price": stop_loss_price,
+                "risk_pct": (risk_per_unit / entry_price) * 100.0,
+                "target_r": target_r,
+                "candidates": candidates,
+            }
+
+        preferred = [c for c in viable if c[3] >= desired_reward]
+        selected = min(preferred or viable, key=lambda item: item[3])
+        source, tp_price, rr, reward_per_unit = selected
+        notional = quantity * entry_price
+        risk_usdt = risk_per_unit * quantity
+        return {
+            "valid": True,
+            "note": "ok",
+            "entry_price": entry_price,
+            "stop_loss_price": stop_loss_price,
+            "take_profit_price": tp_price,
+            "target_source": source,
+            "target_r": target_r,
+            "rr": rr,
+            "risk_pct": (risk_per_unit / entry_price) * 100.0,
+            "reward_pct": (reward_per_unit / entry_price) * 100.0,
+            "risk_usdt": risk_usdt,
+            "notional_usdt": notional,
+            "candidates": candidates,
+        }
 
     def on_order_filled(self, event):
         """
@@ -2124,6 +2526,8 @@ class DeepSeekAIStrategy(Strategy):
             f"{event.last_qty} @ {event.last_px} "
             f"(ID: {filled_order_id[:8]}...)"
         )
+        is_reduce_only = bool(getattr(event, "reduce_only", False) or getattr(event, "is_reduce_only", False))
+        self._force_next_llm_reason = "tp_or_sl_filled" if is_reduce_only else "entry_filled"
 
         # Send Telegram order fill notification
         if self.telegram_bot and self.enable_telegram and self.telegram_notify_fills:
@@ -2142,6 +2546,12 @@ class DeepSeekAIStrategy(Strategy):
     def on_order_rejected(self, event):
         """Handle order rejected events."""
         self.log.error(f"❌ Order rejected: {event.reason}")
+        self._force_next_llm_reason = "order_rejected"
+
+    def on_order_canceled(self, event):
+        """Handle order canceled events."""
+        self.log.warning(f"⚠️ Order canceled: {getattr(event, 'reason', 'unknown')}")
+        self._force_next_llm_reason = "order_canceled"
 
     def on_position_opened(self, event):
         """
@@ -2155,6 +2565,7 @@ class DeepSeekAIStrategy(Strategy):
             f"🟢 Position opened: {event.side.name} "
             f"{event.quantity} @ {event.avg_px_open}"
         )
+        self._force_next_llm_reason = "position_opened"
 
         # Update trailing stop state with actual entry price if it exists
         # (bracket order already initialized it with estimated price)
@@ -2212,12 +2623,15 @@ class DeepSeekAIStrategy(Strategy):
             f"🔴 Position closed: {event.side.name} "
             f"P&L: {float(event.realized_pnl):.2f} USDT"
         )
+        self._force_next_llm_reason = "position_closed"
         
         # Clear trailing stop state
         instrument_key = str(self.instrument_id)
         if instrument_key in self.trailing_stop_state:
             del self.trailing_stop_state[instrument_key]
             self.log.debug(f"🗑️ Cleared trailing stop state for {instrument_key}")
+
+        self._cleanup_oco_orphans()
         
         # Send Telegram position closed notification
         if self.telegram_bot and self.enable_telegram and self.telegram_notify_positions:
