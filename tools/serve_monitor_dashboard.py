@@ -580,6 +580,27 @@ def _parse_log_metrics(log_path: Optional[Path], target_pid: Optional[int] = Non
 
     if metrics.get("current_llm") == {}:
         metrics["current_llm"] = None
+    elif isinstance(metrics.get("current_llm"), dict):
+        current_llm = metrics["current_llm"]
+        if metrics.get("last_signal") is None:
+            signal = current_llm.get("signal")
+            confidence = current_llm.get("confidence")
+            if signal or confidence:
+                metrics["last_signal"] = {
+                    "signal": signal or "N/A",
+                    "confidence": confidence or "N/A",
+                }
+        if not metrics.get("last_signal_reason"):
+            thesis = current_llm.get("thesis")
+            if isinstance(thesis, str) and thesis.strip():
+                metrics["last_signal_reason"] = thesis
+
+    if metrics.get("deepseek_calls", 0) == 0:
+        metrics["deepseek_calls"] = sum(
+            1
+            for convo in metrics.get("llm_conversations", [])
+            if convo.get("response_json") or convo.get("response_raw")
+        )
 
     return metrics
 
