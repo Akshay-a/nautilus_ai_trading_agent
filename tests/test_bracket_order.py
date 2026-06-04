@@ -175,7 +175,7 @@ def _ensure_nautilus_stub() -> None:
 _ensure_nautilus_stub()
 sys.modules.pop("strategy.deepseek_strategy", None)
 
-from nautilus_trader.model.enums import OrderSide, OrderType  # type: ignore
+from nautilus_trader.model.enums import OrderSide, OrderType, PositionSide  # type: ignore
 from strategy.deepseek_strategy import DeepSeekAIStrategy
 
 
@@ -252,12 +252,22 @@ def _make_strategy_stub() -> DeepSeekAIStrategy:
     strategy.dry_run = False
     strategy.enable_trailing_stop = False
     strategy.trailing_stop_state = {}
+    strategy.telegram_bot = None
+    strategy.enable_telegram = False
+    strategy.telegram_notify_positions = False
+    strategy.telegram_notify_fills = False
+    strategy._force_next_llm_reason = None
     strategy.log = DummyLogger()
     return strategy
 
 
 def test_submit_bracket_order_uses_latest_price_data() -> None:
     strategy = _make_strategy_stub()
+    strategy.latest_technical_data = {
+        "support": 988.0,
+        "resistance": 1020.0,
+        "atr": 10.0,
+    }
 
     strategy._submit_bracket_order(OrderSide.BUY, 0.01)
 
@@ -268,8 +278,8 @@ def test_submit_bracket_order_uses_latest_price_data() -> None:
     assert strategy.order_factory.kwargs["entry_order_type"] == OrderType.LIMIT
     assert strategy.order_factory.kwargs["entry_price"] == Decimal("1000.0")
     assert strategy.order_factory.kwargs["entry_post_only"] is True
-    assert tp_price == Decimal("1050.0")
-    assert sl_trigger == Decimal("949.05")
+    assert tp_price == Decimal("1020.0")
+    assert sl_trigger == Decimal("987.012")
     strategy.submit_order_list.assert_called_once()
     strategy._submit_order.assert_not_called()
 
@@ -297,6 +307,21 @@ def test_submit_bracket_order_uses_llm_levels_first() -> None:
     assert result["bracket_plan"]["levels_source"] == "llm"
     assert strategy.order_factory.kwargs["sl_trigger_price"] == Decimal("990.0")
     assert strategy.order_factory.kwargs["tp_price"] == Decimal("1020.0")
+
+
+def test_submit_bracket_order_persists_actual_bracket_levels_into_signal_context() -> None:
+    strategy = _make_strategy_stub()
+    strategy.latest_signal_data.update({"stop_loss": 990.0, "take_profit": 1020.0})
+    strategy.last_signal = strategy.latest_signal_data
+
+    result = strategy._submit_bracket_order(OrderSide.BUY, 0.01)
+
+    assert result["status"] == "submitted"
+    assert strategy.latest_signal_data["submitted_entry_price"] == 1000.0
+    assert strategy.latest_signal_data["submitted_stop_loss"] == 990.0
+    assert strategy.latest_signal_data["submitted_take_profit"] == 1020.0
+    assert strategy.latest_signal_data["invalidation_price"] == 990.0
+    assert strategy.last_signal["submitted_stop_loss"] == 990.0
 
 
 def test_submit_bracket_order_falls_back_to_symmetric_one_pct() -> None:
@@ -331,7 +356,7 @@ def _configure_execution_stub(strategy: DeepSeekAIStrategy) -> None:
     strategy._log_warning_safe = Mock()
 
 
-def test_exit_now_submits_one_reduce_only_close_without_reversal() -> None:
+def test_exit_now_while_exposed_is_ignored_and_holds_position() -> None:
     strategy = _make_strategy_stub()
     _configure_execution_stub(strategy)
 
@@ -342,12 +367,54 @@ def test_exit_now_submits_one_reduce_only_close_without_reversal() -> None:
         current_position={"side": "short", "quantity": 2.5},
     )
 
-    assert result["action"] == "exit_now"
-    strategy._submit_order.assert_called_once_with(
-        side=OrderSide.BUY,
-        quantity=2.5,
-        reduce_only=True,
+    assert result["status"] == "hold"
+    assert result["action"] == "hold_position"
+    assert result["note"] == "exit_now_ignored_while_exposed"
+    strategy._submit_order.assert_not_called()
+
+
+def test_on_position_opened_does_not_force_next_llm_wakeup() -> None:
+    strategy = _make_strategy_stub()
+    strategy._force_next_llm_reason = None
+    event = SimpleNamespace(side=PositionSide.LONG, quantity=1.25, avg_px_open=1000.0)
+
+    strategy.on_position_opened(event)
+
+    assert strategy._force_next_llm_reason is None
+
+
+def test_on_order_filled_entry_does_not_force_next_llm_wakeup() -> None:
+    strategy = _make_strategy_stub()
+    strategy._force_next_llm_reason = None
+    event = SimpleNamespace(
+        client_order_id="abc123",
+        order_side=OrderSide.BUY,
+        last_qty=1.25,
+        last_px=1000.0,
+        reduce_only=False,
+        is_reduce_only=False,
     )
+
+    strategy.on_order_filled(event)
+
+    assert strategy._force_next_llm_reason is None
+
+
+def test_on_order_filled_reduce_only_still_forces_reanalysis() -> None:
+    strategy = _make_strategy_stub()
+    strategy._force_next_llm_reason = None
+    event = SimpleNamespace(
+        client_order_id="abc123",
+        order_side=OrderSide.SELL,
+        last_qty=1.25,
+        last_px=999.0,
+        reduce_only=True,
+        is_reduce_only=True,
+    )
+
+    strategy.on_order_filled(event)
+
+    assert strategy._force_next_llm_reason == "tp_or_sl_filled"
 
 
 def test_entry_action_while_exposed_is_noop() -> None:
@@ -373,6 +440,7 @@ def _baseline_market_state() -> Dict[str, Any]:
         "open_orders_count": 0,
         "has_pending_intent": False,
         "app_regime": "trend_down",
+        "structure_state": "inside_range",
         "main_pressure": "neutral",
         "main_regime_shift": "stable",
         "main_trade_flow_imbalance": 0.05,
@@ -585,6 +653,33 @@ def test_in_position_invalidation_proximity_wakes_llm() -> None:
     assert reason == "position_invalidation_threat"
 
 
+def test_extract_position_invalidation_price_prefers_numeric_field_over_free_text() -> None:
+    strategy = _make_strategy_stub()
+    strategy.last_signal = {
+        "stop_loss": 1012.0,
+        "invalidation_price": 1010.5,
+        "invalidation": "Structure fails above 1020.0.",
+    }
+
+    price = strategy._extract_position_invalidation_price({"side": "short", "quantity": 1.0}, 1000.0)
+
+    assert price == 1010.5
+
+
+def test_extract_position_invalidation_price_prefers_submitted_stop_loss_when_present() -> None:
+    strategy = _make_strategy_stub()
+    strategy.last_signal = {
+        "submitted_stop_loss": 1009.25,
+        "invalidation_price": 1010.5,
+        "stop_loss": 1012.0,
+        "invalidation": "Structure fails above 1020.0.",
+    }
+
+    price = strategy._extract_position_invalidation_price({"side": "short", "quantity": 1.0}, 1000.0)
+
+    assert price == 1009.25
+
+
 def test_removed_legacy_wakeup_triggers_absent_from_strategy_source() -> None:
     source = (Path(__file__).resolve().parents[1] / "strategy" / "deepseek_strategy.py").read_text(
         encoding="utf-8"
@@ -606,6 +701,167 @@ def test_cleanup_oco_orphans_cancels_reduce_only_orders_when_flat() -> None:
     strategy._cleanup_oco_orphans()
 
     strategy.cancel_order.assert_called_once_with(reduce_only)
+
+
+def test_flat_no_action_trend_ttl_rearms_llm() -> None:
+    strategy = _make_strategy_stub()
+    strategy.enable_market_state_gate = True
+    strategy._force_next_llm_reason = None
+    strategy.last_signal = {
+        "signal": "HOLD",
+        "position_action": "NO_ACTION",
+        "watch_trigger": "Break below 990.0 with sell-heavy flow.",
+    }
+    previous = _baseline_market_state()
+    strategy._last_llm_market_state = previous
+
+    should_call, reason = strategy._should_call_llm(
+        dict(previous),
+        {"price": 1000.0, "high": 1001.0, "low": 999.0, "bars_since_last_llm_decision": 3},
+    )
+
+    assert should_call is True
+    assert reason == "flat_thesis_ttl_expired"
+
+
+def test_flat_watch_trigger_expired_rearms_llm() -> None:
+    strategy = _make_strategy_stub()
+    strategy.enable_market_state_gate = True
+    strategy._force_next_llm_reason = None
+    strategy.last_signal = {
+        "signal": "HOLD",
+        "position_action": "NO_ACTION",
+        "watch_trigger_price": 990.0,
+        "watch_trigger_direction": "short",
+        "watch_trigger_expiry_bars": 2,
+    }
+    previous = _baseline_market_state()
+    strategy._last_llm_market_state = previous
+
+    should_call, reason = strategy._should_call_llm(
+        dict(previous),
+        {"price": 1000.0, "high": 1001.0, "low": 999.0, "bars_since_last_llm_decision": 2},
+    )
+
+    assert should_call is True
+    assert reason == "watch_trigger_expired"
+
+
+def test_flat_watch_trigger_fired_rearms_llm() -> None:
+    strategy = _make_strategy_stub()
+    strategy.enable_market_state_gate = True
+    strategy._force_next_llm_reason = None
+    strategy.last_signal = {
+        "signal": "HOLD",
+        "position_action": "NO_ACTION",
+        "watch_trigger": "Break below 995.0 with sell-heavy flow.",
+    }
+    previous = _baseline_market_state()
+    strategy._last_llm_market_state = previous
+
+    should_call, reason = strategy._should_call_llm(
+        dict(previous, price=993.0),
+        {"price": 993.0, "high": 994.0, "low": 992.5, "bars_since_last_llm_decision": 1},
+    )
+
+    assert should_call is True
+    assert reason == "watch_trigger_fired"
+
+
+def test_flat_watch_trigger_prefers_structured_fields() -> None:
+    strategy = _make_strategy_stub()
+    spec = strategy._parse_watch_trigger_spec(
+        {
+            "watch_trigger": "Ignore this narrative level 900.0.",
+            "watch_trigger_price": 992.0,
+            "watch_trigger_direction": "short",
+            "watch_trigger_expiry_bars": 4,
+        }
+    )
+
+    assert spec is not None
+    assert spec["price"] == 992.0
+    assert spec["direction"] == "short"
+    assert spec["source"] == "structured"
+
+
+def test_flat_trend_continuation_rearms_llm() -> None:
+    strategy = _make_strategy_stub()
+    strategy.enable_market_state_gate = True
+    strategy._force_next_llm_reason = None
+    strategy.last_signal = {"signal": "HOLD", "position_action": "NO_ACTION"}
+    previous = _baseline_market_state()
+    strategy._last_llm_market_state = previous
+
+    should_call, reason = strategy._should_call_llm(
+        dict(previous, price=996.0),
+        {"price": 996.0, "high": 997.0, "low": 995.5, "bars_since_last_llm_decision": 1},
+    )
+
+    assert should_call is True
+    assert reason == "trend_continuation_progress"
+
+
+def test_in_position_does_not_rearm_on_flat_ttl() -> None:
+    strategy = _make_strategy_stub()
+    strategy.enable_market_state_gate = True
+    strategy._force_next_llm_reason = None
+    strategy.last_signal = {"signal": "HOLD", "position_action": "NO_ACTION"}
+    previous = dict(_baseline_market_state(), position_key="short:1.0")
+    strategy._last_llm_market_state = previous
+
+    should_call, reason = strategy._should_call_llm(
+        dict(previous),
+        {"price": 1000.0, "high": 1001.0, "low": 999.0, "bars_since_last_llm_decision": 6},
+    )
+
+    assert should_call is False
+    assert reason == "no_material_market_change"
+
+
+def test_llm_bracket_rejects_stop_tighter_than_atr_floor() -> None:
+    strategy = _make_strategy_stub()
+    strategy.latest_technical_data = {"support": 990.0, "resistance": 1010.0, "atr": 10.0}
+    strategy.latest_signal_data.update({"stop_loss": 995.0, "take_profit": 1020.0})
+
+    plan = strategy._build_llm_bracket_plan(OrderSide.BUY, 1000.0, 0.01)
+
+    assert plan is None
+
+
+def test_llm_bracket_requires_higher_rr_for_wider_stop() -> None:
+    strategy = _make_strategy_stub()
+    strategy.latest_technical_data = {"support": 990.0, "resistance": 1010.0, "atr": 10.0}
+    strategy.latest_signal_data.update({"stop_loss": 985.0, "take_profit": 1007.5})
+
+    plan = strategy._build_llm_bracket_plan(OrderSide.BUY, 1000.0, 0.01)
+
+    assert plan is None
+
+
+def test_llm_bracket_accepts_geometry_with_net_rr_after_friction() -> None:
+    strategy = _make_strategy_stub()
+    strategy.latest_technical_data = {"support": 990.0, "resistance": 1010.0, "atr": 10.0}
+    strategy.latest_price_data = {"price": 1000.0, "microstructure": {"spread_bps": 2.0}}
+    strategy.latest_signal_data.update({"stop_loss": 988.0, "take_profit": 1024.0})
+
+    plan = strategy._build_llm_bracket_plan(OrderSide.BUY, 1000.0, 0.01)
+
+    assert plan is not None
+    assert plan["levels_source"] == "llm"
+    assert plan["required_rr"] == 1.0
+    assert plan["net_rr"] > plan["required_rr"]
+
+
+def test_fallback_bracket_remains_available_when_llm_geometry_fails() -> None:
+    strategy = _make_strategy_stub()
+    strategy.latest_technical_data = {"support": 970.0, "resistance": 1010.0, "atr": 10.0}
+    strategy.latest_signal_data.update({"stop_loss": 995.0, "take_profit": 1020.0})
+
+    result = strategy._submit_bracket_order(OrderSide.BUY, 0.01)
+
+    assert result["status"] == "submitted"
+    assert result["bracket_plan"]["levels_source"] == "fallback_1pct"
 
 
 if __name__ == "__main__":

@@ -1,5 +1,131 @@
 # TODO
 
+## Plan (Trend Participation Implementation - 2026-06-05)
+- [x] Implement strategy-side participation changes first: flat-only LLM rearm, structured watch-trigger state, ATR-aware stop geometry, and dynamic RR gating without changing fixed `2500` margin / `20x` leverage semantics.
+- [x] Verify the strategy slice in isolation with targeted tests before making the prompt more permissive.
+- [x] Implement prompt/schema changes second: structured trigger fields, explicit hold-reason / thesis-state contract, and stronger strong-trend participation framing.
+- [x] Re-run focused verification, then summarize the remaining measurement gaps and rollout risks.
+
+## Review (Trend Participation Implementation - 2026-06-05)
+- Strategy-side participation shell changes in `strategy/deepseek_strategy.py`:
+  - Added flat-only rearm logic for stale `NO_ACTION` theses via regime TTL, structured watch-trigger fire/expiry, structure-state changes, trend-continuation progress, and support/resistance-walk extension.
+  - Added machine-readable watch-trigger parsing for `watch_trigger_price`, `watch_trigger_direction`, and `watch_trigger_expiry_bars`, while retaining free-text trigger fallback.
+  - Preserved tight in-position wakeups; new rearm logic is flat-only and does not reopen exposed-position churn.
+  - Added ATR-aware stop-width floor/cap, dynamic minimum RR by risk width, and net-R-after-friction validation for LLM and structural bracket geometry.
+  - Persisted actual submitted bracket levels and invalidation price back into signal context so later LLM reviews see the real trade geometry.
+- Prompt/schema changes in `utils/deepseek_client.py`:
+  - Reframed strong-trend flat behavior so `NO_ACTION` in `TREND_UP` / `TREND_DOWN` now carries burden-of-proof and requires a named `hold_reason`.
+  - Made `HOLD_POSITION` vs `NO_ACTION` explicit in both the system prompt and analysis prompt; flat waits and in-position holds now have separate contracts.
+  - Added structured prompt/schema fields for continuity and trigger tracking: `hold_reason`, `setup_type`, `thesis_state`, `prior_trigger_status`, `watch_trigger_price`, `watch_trigger_direction`, and `watch_trigger_expiry_bars`.
+  - Expanded `PRIOR_DECISION` prompt context with structured trigger state, prior bracket levels, numeric invalidation, and a required trigger-adjudication instruction.
+  - Added parser normalization so new optional fields are preserved when valid and dropped safely when malformed.
+- Verification:
+  - `python -m py_compile strategy/deepseek_strategy.py utils/deepseek_client.py`
+  - `pytest -q tests/test_bracket_order.py` -> `33 passed`
+  - `pytest -q tests/test_strategy_components.py` -> `20 passed`
+- Remaining rollout gaps:
+  - Need live-session audit after restart to measure whether hold-rate improvement comes from more qualified flat re-arms rather than noisier low-quality entries.
+  - Still need post-rollout metrics split by `hold_reason`, `setup_type`, and trend regime to confirm whether the model is trading more in qualified directional states instead of merely generating more calls.
+
+## Plan (High Hold-Rate Council + Participation Spec - 2026-06-05)
+- [x] Refresh the current prompt, decision gate, and recent hold-rate evidence from the repo/logs so the council works from current code rather than stale assumptions.
+- [x] Run five read-only model agents with distinct roles (quant PM, execution/risk, regime/prompt, continuity/state, expectancy/research) on the same high-hold-rate problem.
+- [x] Synthesize the council outputs into one concrete prompt + decision-layer specification that increases market participation without weakening risk ownership or changing the fixed `2500` margin / `20x` leverage sizing semantics.
+- [x] Explicitly address wider ATR-aware stop geometry, flat-state re-entry rules, trend-continuation participation, and the remaining reasons the system still sits out too much.
+- [x] Add review notes with the agreed recommendation and operational tradeoffs.
+
+## Review (High Hold-Rate Council + Participation Spec - 2026-06-05)
+- Refreshed current state from code:
+  - prompt already includes `playbook`, `watch_trigger`, `invalidation_price`, and persisted bracket levels;
+  - gate currently wakes on structure crosses, invalidation threat, micro numeric band exits, and a few lifecycle exceptions;
+  - sizing remains fixed at `2500` margin with `20x` leverage (`~50K` notional).
+- Five-agent council conclusion:
+  - The problem is not just “prompt too conservative.” It is the interaction of:
+    - sticky flat `NO_ACTION` theses,
+    - watch triggers that are still mostly narrative instead of deterministic gate inputs,
+    - structure-cross rules that miss support-walk / trend-follow-through behavior,
+    - and historical stop geometry that was too tight relative to ATR.
+  - Lowering raw HOLD rate is the wrong objective. The correct objective is lower HOLD specifically in qualified strong-trend continuation states while keeping HOLD high in chop/range.
+- Agreed prompt-layer direction:
+  - Make `NO_ACTION` the burden-of-proof outcome when flat in `TREND_DOWN` / `TREND_UP`, not the default.
+  - Force explicit adjudication of prior `watch_trigger` every time the LLM is called.
+  - Separate playbooks by setup type: continuation gets looser approval than reversals/exhausted breakouts.
+  - Add explicit thesis-state / trigger-state / hold-reason fields so repeated “wait for bounce / support / oversold” loops become measurable and rejectable.
+  - Frame the task as “capture a reasonable share of clean directional moves when net edge is positive after costs,” not “predict the next bar.”
+- Agreed decision-layer direction:
+  - Add flat-only rearm logic; do not reopen in-position churn.
+  - Re-arm flat `NO_ACTION` theses on:
+    - TTL expiry by regime,
+    - structured watch-trigger fire/expiry,
+    - new-low / new-high extension in strong trends,
+    - failed-bounce / support-walk follow-through,
+    - and finer-grained structure-state bucket changes instead of only first cross events.
+  - Keep existing in-position guards tight: invalidation threat and lifecycle events remain the main reasons to re-analyze while exposed.
+- Agreed stop-geometry / RR direction under fixed `50K` notional:
+  - Wider ATR-aware stops are acceptable only in strong-regime continuation states.
+  - Use an ATR floor so stops tighter than normal noise are rejected or widened.
+  - Use a hard risk ceiling because wider stops under fixed notional raise absolute USDT loss materially.
+  - Raise effective RR requirements as stop width increases; the current flat `min_entry_rr=0.5` is too loose for wider stops.
+  - Judge entries on `net_R` after friction, not just gross RR.
+- Recommended implementation order from the council:
+  1. Make `watch_trigger` machine-readable and gate-aware.
+  2. Add flat-only trend rearm rules (expiry + continuation progress + support-walk / failed-bounce triggers).
+  3. Rebalance the prompt so strong-trend participation is the default unless a concrete disqualifier exists.
+  4. Introduce ATR-aware stop-width floors/caps and net-R gating for wider stops.
+  5. Track outcome metrics by regime/setup type, not just total hold rate.
+
+## Plan (Execution Ownership Refactor + Prompt Council - 2026-06-05)
+- [x] Remove immediate next-bar LLM re-analysis after `position_opened` and narrow in-position forced wakeups to true lifecycle exceptions only.
+- [x] Remove default discretionary `EXIT_NOW` as a normal live close path so `HOLD_POSITION` actually defers to bracket/trade-plan ownership.
+- [x] Preserve current sizing/leverage/notional semantics and avoid widening the patch into a new architecture or config redesign.
+- [x] Add focused tests proving filled positions do not trigger immediate re-analysis and that exposed `HOLD_POSITION` does not get converted into an app-layer close.
+- [x] Run compile + targeted pytest verification on the changed strategy/prompt/test files.
+- [x] Run a fresh prompt/context model council and capture concrete LLM-layer changes that improve regime handling, continuity, RR awareness, and trade participation without reopening app-layer churn.
+
+## Review (Execution Ownership Refactor + Prompt Council - 2026-06-05)
+- Execution ownership changes:
+  - Removed the `position_opened` forced next-bar LLM wakeup in `strategy/deepseek_strategy.py`.
+  - Entry fills no longer force immediate next-bar re-analysis; reduce-only TP/SL fills still set `tp_or_sl_filled`.
+  - Exposed `EXIT_NOW` is no longer an active close path. The strategy now ignores it while bracket-owned exposure is open and treats the position as held.
+  - `utils/deepseek_client.py` now coerces legacy `position_action=EXIT_NOW` to `HOLD_POSITION` so the prompt/runtime contract matches the strategy.
+- Prompt/context continuity changes:
+  - Added optional numeric `invalidation_price` to the model contract and parsing path.
+  - Strategy invalidation extraction now prefers submitted bracket stop / numeric invalidation price before free-text heuristics.
+  - Entry brackets now persist submitted entry / stop / take-profit levels back into the signal context so later prompts see the real trade geometry.
+  - Prior-decision prompt context now includes `playbook`, `watch_trigger`, numeric invalidation, and actual submitted entry/SL/TP levels.
+  - Friction framing now switches to exit-leg cost when already in a trade instead of always presenting round-trip cost.
+  - Prompt instructions now explicitly support trend continuation behavior (`TREND_DOWN` failed-bounce / support-walk / breakdown shorts) and require a concrete `watch_trigger` when choosing flat `NO_ACTION`.
+- Quant council conclusions:
+  - The current ~90% hold rate is not mainly due to missing indicators; it is mostly prompt conservatism plus sticky `NO_ACTION` continuity.
+  - Highest-leverage next changes after this patch are: stronger trend-down short playbooks, numeric invalidation everywhere, concrete `watch_trigger` follow-through, and opportunity-miss metrics tied to `strong_down` flat windows.
+  - Do not start a separate repo yet; NautilusTrader’s built-in strategy/order lifecycle is sufficient. The right move is a v2 path inside this repo, not a greenfield rebuild.
+- Verification:
+  - `python -m py_compile strategy/deepseek_strategy.py utils/deepseek_client.py`
+  - `pytest -q tests/test_bracket_order.py` -> `23 passed`
+  - `pytest -q tests/test_strategy_components.py` -> `17 passed`
+
+## Plan (LinkedIn Dashboard Snapshot - 2026-06-03)
+- [x] Inspect existing exported signal-analysis artifacts and choose one consistent session for the visual.
+- [x] Build a reusable generator that converts the selected quant dataset into a LinkedIn-friendly standalone HTML snapshot.
+- [x] Verify the rendered output locally and record where to open it for screenshot capture.
+
+## Review (LinkedIn Dashboard Snapshot - 2026-06-03)
+- Added `scripts/build_linkedin_dashboard_snapshot.py` to generate a shareable dashboard snapshot from the latest `logs/llm_quant_dataset*.csv` export or an explicitly provided dataset.
+- Updated the generator to prefer the broader aggregate dataset `logs/llm_quant_dataset.csv` when present, so the public snapshot reflects multiple sessions instead of only the newest session export.
+- Removed internal filenames and source-session labels from the public-facing HTML so the screenshot is upload-safe for LinkedIn.
+- Generated `artifacts/linkedin_dashboard_snapshot.html` with a LinkedIn-friendly summary of total signals, hold rate, realized win/loss split, net realized PnL, latency, signal mix, and realized close distribution.
+- Verified the HTML render by producing `artifacts/linkedin_dashboard_snapshot.png` through headless Chrome using the generated HTML.
+
+## Plan (LinkedIn Post Draft - 2026-06-03)
+- [x] Review prior project context, public positioning, and the user's intended talking points for the third update post.
+- [x] Draft a concise LinkedIn post that keeps the original experimentation tone while highlighting traction, technical learnings, and the open-source follow-up.
+- [x] Verify the final wording against the current repo context so the claims remain high-level but accurate.
+
+## Review (LinkedIn Post Draft - 2026-06-03)
+- Delivered one primary LinkedIn post draft for the third public update on the project.
+- Kept the tone close to the user's first post: experimental, technical, and grounded rather than promotional.
+- Included the requested traction signals (`250` followers, `50+` conversations), the main iteration learnings (market-context framing, R-based thinking with slippage/funding, prompt iteration count), and the upcoming open-source backend testing + LLM integration release note.
+
 ## Plan (Historical Context-Parity Backtesting Research - 2026-06-02)
 - [x] Audit the current live and backtesting architecture for bar inputs, order book inputs, feature generation, and LLM-call parity.
 - [x] Verify whether `feature/backtesting-layer` adds anything not already present in `main`, and identify remaining replay gaps.

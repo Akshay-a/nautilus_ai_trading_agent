@@ -56,3 +56,24 @@
 ## 2026-06-02 (Verify Exchange Position Before Reporting)
 - User correction: the monitor summary exposed a stale open-position field after the exchange position had already closed.
 - Rule: before reporting current exposure, verify the latest Bybit risk context `position` field and recent executions; treat monitor-derived open-position summaries as stale when they conflict with exchange-backed context.
+
+## 2026-06-03 (Project Update Writing Must Preserve Core Domain)
+- User correction: a project update draft omitted the central trading/experiment framing and underplayed the value of the conversations that came from sharing the work publicly.
+- Rule: when writing public updates for this repo, explicitly name the work as a trading experiment and restate the core question being tested so the post does not read like a generic builder update.
+- Rule: if the user highlights relationship or learning outcomes from sharing the project, include that angle directly instead of treating it as implied context.
+
+## 2026-06-03 (Public Dashboard Assets Need Correct Scope)
+- User correction: a social-share dashboard used a single-session export and exposed internal source naming, which understated profitable closes and looked too implementation-specific for LinkedIn.
+- Rule: for public-facing artifacts in this repo, verify whether an aggregate dataset already exists before defaulting to the latest session export.
+- Rule: remove internal filenames, vendor-specific source labels, and other implementation references from screenshots unless the user explicitly wants them shown.
+
+## 2026-06-05 (Isolate Layers Before Rebuilding)
+- User correction: the right path is to isolate execution and LLM layers inside the current repo, not default to a greenfield architecture rewrite.
+- Rule: when live behavior is wrong but the platform integration is still usable, prefer a scoped v2 path or layer isolation inside the repo before proposing a separate project.
+- Rule: fix application-layer ownership conflicts first (forced re-analysis, conflicting exit owners, state handoff) before blaming prompt quality alone.
+
+## 2026-06-05 (Gate Before Prompt Aggression)
+- User correction: high hold-rate diagnosis must separate gate-produced holds from LLM-produced holds; prompt aggressiveness is not the first lever when the gate is the dominant bottleneck.
+- Rule: before making the model more aggressive, verify how much of the inactivity is created by the decision shell versus the prompt, using existing journal fields or adding the minimum telemetry needed.
+- Rule: make continuity machine-readable before asking the model to participate more; narrative `watch_trigger` text is not enough for reliable re-arm logic.
+- Rule: when flat-state participation is too low, loosen flat re-arm and trigger adjudication first, while keeping in-position wakeups tight so the fix does not reintroduce churn.

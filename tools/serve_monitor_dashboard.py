@@ -37,10 +37,6 @@ RE_SIGNAL = re.compile(
 )
 RE_PRICE = re.compile(r"Current Price:\s*\$([0-9,]+(?:\.[0-9]+)?)")
 RE_RSI = re.compile(r"RSI:\s*([0-9]+(?:\.[0-9]+)?)")
-RE_POSITION_CURRENT = re.compile(
-    r"Current Position:\s*(long|short)\s*([0-9.]+)(?:\s+[A-Z]+)?\s*@\s*\$([0-9,]+(?:\.[0-9]+)?)",
-    re.IGNORECASE,
-)
 RE_POSITION_OPENED = re.compile(
     r"🟢 Position opened:\s*(LONG|SHORT)\s*([0-9.]+)\s*@\s*([0-9.]+)"
 )
@@ -51,6 +47,46 @@ RE_POSITION_AVG = re.compile(r"Position avg_px verified .*internal=([0-9]+(?:\.[
 RE_LLM_PROMPT_PAYLOAD = re.compile(r"🤖 LLM Prompt Payload:\s*(\{.*\})$")
 RE_LLM_RESPONSE_JSON = re.compile(r"🤖 LLM Response JSON:\s*(\{.*\})$")
 RE_LLM_RAW_RESPONSE = re.compile(r"🤖 DeepSeek Raw Response:\s*(.+)", re.DOTALL)
+RE_BAR_CLOSE = re.compile(
+    r"📌 Bar-close @ (?P<bar_ts>\S+)\s+"
+    r"px=\$(?P<price>[\d,.]+)\s+"
+    r"trend=(?P<trend>\S+)\s+"
+    r"rsi=(?P<rsi>[\d.]+)\s+"
+    r"rvol=(?P<rvol>[\d.]+)\s+"
+    r"ob_tfi=(?P<ob_tfi>[+\-\d.]+)\s+"
+    r"regime=(?P<ob_regime>\S+)"
+)
+RE_POSITION_CURRENT = re.compile(
+    r"Current Position:\s*(?P<side>long|short)\s*(?P<qty>[0-9.]+)(?:\s+\w+)?\s*@\s*\$"
+    r"(?P<entry>[0-9,]+(?:\.[0-9]+)?)"
+    r"(?:\s+uPnL=(?P<upnl>[+-]?[0-9.]+))?"
+    r"(?:\s+health=(?P<health>[a-z_]+))?",
+    re.IGNORECASE,
+)
+
+_LLM_SYNTHESIS_KEYS = (
+    "signal",
+    "confidence",
+    "position_action",
+    "regime",
+    "playbook",
+    "thesis",
+    "hold_reason",
+    "setup_type",
+    "thesis_state",
+    "prior_trigger_status",
+    "watch_trigger",
+    "watch_trigger_price",
+    "watch_trigger_direction",
+    "watch_trigger_expiry_bars",
+    "invalidation",
+    "invalidation_price",
+    "execution_note",
+    "volume_note",
+    "risk_assessment",
+    "trend_strength",
+    "target_r",
+)
 
 
 @dataclass
@@ -58,6 +94,8 @@ class PositionState:
     side: str
     quantity: float
     entry_price: Optional[float]
+    unrealized_pnl: Optional[float] = None
+    health: Optional[str] = None
 
 
 def _latest_json_log() -> Optional[Path]:
@@ -173,6 +211,66 @@ def _strategy_process_state() -> Dict[str, Any]:
     return {"running": running, "pid": pid}
 
 
+def _llm_synthesis_snapshot(data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Extract present LLM synthesis fields; omit empty values for backward compatibility."""
+    if not isinstance(data, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    for key in _LLM_SYNTHESIS_KEYS:
+        val = data.get(key)
+        if val is None:
+            continue
+        if isinstance(val, str) and not val.strip():
+            continue
+        out[key] = val
+    if "thesis" not in out:
+        reason = data.get("reason")
+        if isinstance(reason, str) and reason.strip():
+            out["thesis"] = reason.strip()
+    return out
+
+
+def _merge_current_llm(metrics: Dict[str, Any], patch: Dict[str, Any]) -> None:
+    current = metrics.get("current_llm")
+    if not isinstance(current, dict):
+        current = {}
+    current.update(patch)
+    metrics["current_llm"] = current
+
+
+def _position_alignment(
+    log_pos: Optional[Dict[str, Any]],
+    ex_pos: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Compare strategy-log position vs exchange snapshot."""
+    log_side = str((log_pos or {}).get("side") or "").upper()
+    ex_side = str((ex_pos or {}).get("side") or "").upper()
+    log_qty = (log_pos or {}).get("quantity")
+    ex_qty = (ex_pos or {}).get("quantity")
+
+    log_open = bool(log_side and isinstance(log_qty, (int, float)) and log_qty > 0)
+    ex_open = bool(ex_side and isinstance(ex_qty, (int, float)) and ex_qty > 0)
+
+    if not log_open and not ex_open:
+        state = "flat"
+    elif log_open and not ex_open:
+        state = "log_only"
+    elif ex_open and not log_open:
+        state = "exchange_only"
+    elif log_side == ex_side:
+        state = "aligned"
+    else:
+        state = "side_mismatch"
+
+    return {
+        "state": state,
+        "log_open": log_open,
+        "exchange_open": ex_open,
+        "log_side": log_side or None,
+        "exchange_side": ex_side or None,
+    }
+
+
 def _session_base_name(path_str: str) -> str:
     """
     Normalize rotated and non-rotated log path into one session key.
@@ -256,6 +354,8 @@ def _parse_log_metrics(log_path: Optional[Path], target_pid: Optional[int] = Non
         "recent_events": [],
         "recent_warnings_errors": [],
         "llm_conversations": [],
+        "bar_close": None,
+        "current_llm": None,
     }
 
     # Read all rotated files for this session in chronological order
@@ -316,6 +416,18 @@ def _parse_log_metrics(log_path: Optional[Path], target_pid: Optional[int] = Non
                 if m_rsi:
                     metrics["last_rsi"] = float(m_rsi.group(1))
 
+                m_bar = RE_BAR_CLOSE.search(msg)
+                if m_bar:
+                    metrics["bar_close"] = {
+                        "bar_ts": m_bar.group("bar_ts"),
+                        "price": float(m_bar.group("price").replace(",", "")),
+                        "trend": m_bar.group("trend"),
+                        "rsi": float(m_bar.group("rsi")),
+                        "rvol": float(m_bar.group("rvol")),
+                        "ob_tfi": float(m_bar.group("ob_tfi")),
+                        "ob_regime": m_bar.group("ob_regime"),
+                    }
+
                 m_signal = RE_SIGNAL.search(msg)
                 if m_signal:
                     signal, confidence, api_sec, reason = m_signal.groups()
@@ -323,6 +435,19 @@ def _parse_log_metrics(log_path: Optional[Path], target_pid: Optional[int] = Non
                     metrics["last_signal"] = {"signal": signal, "confidence": confidence}
                     metrics["last_signal_api_sec"] = float(api_sec)
                     metrics["last_signal_reason"] = reason.strip()
+                    _merge_current_llm(
+                        metrics,
+                        {
+                            "signal": signal,
+                            "confidence": confidence,
+                            "api_time_sec": float(api_sec),
+                            "ts_signal": ts,
+                        },
+                    )
+                    if reason.strip():
+                        cur = metrics.get("current_llm") or {}
+                        if not cur.get("thesis"):
+                            _merge_current_llm(metrics, {"thesis": reason.strip()})
                     if not metrics["llm_conversations"] or metrics["llm_conversations"][-1].get("signal"):
                         metrics["llm_conversations"].append(
                             {"ts_prompt": None, "prompt_payload": None, "ts_response": ts}
@@ -338,11 +463,14 @@ def _parse_log_metrics(log_path: Optional[Path], target_pid: Optional[int] = Non
 
                 m_pos_cur = RE_POSITION_CURRENT.search(msg)
                 if m_pos_cur:
-                    side, qty, entry_px = m_pos_cur.groups()
+                    gd = m_pos_cur.groupdict()
+                    upnl_raw = gd.get("upnl")
                     position = PositionState(
-                        side=side.upper(),
-                        quantity=float(qty),
-                        entry_price=float(entry_px.replace(",", "")),
+                        side=gd["side"].upper(),
+                        quantity=float(gd["qty"]),
+                        entry_price=float(gd["entry"].replace(",", "")),
+                        unrealized_pnl=float(upnl_raw) if upnl_raw else None,
+                        health=gd.get("health"),
                     )
 
                 m_pos_open = RE_POSITION_OPENED.search(msg)
@@ -396,6 +524,11 @@ def _parse_log_metrics(log_path: Optional[Path], target_pid: Optional[int] = Non
                         resp_json = json.loads(m_resp_json.group(1))
                     except json.JSONDecodeError:
                         resp_json = {"raw": m_resp_json.group(1)}
+                    if isinstance(resp_json, dict):
+                        _merge_current_llm(
+                            metrics,
+                            {**_llm_synthesis_snapshot(resp_json), "ts_response": ts},
+                        )
                     convo = pending_prompt or {"ts_prompt": None, "prompt_payload": None}
                     convo["ts_response"] = ts
                     convo["response_json"] = resp_json
@@ -440,6 +573,13 @@ def _parse_log_metrics(log_path: Optional[Path], target_pid: Optional[int] = Non
             "quantity": position.quantity,
             "entry_price": position.entry_price,
         }
+        if position.unrealized_pnl is not None:
+            metrics["open_position"]["unrealized_pnl"] = position.unrealized_pnl
+        if position.health:
+            metrics["open_position"]["health"] = position.health
+
+    if metrics.get("current_llm") == {}:
+        metrics["current_llm"] = None
 
     return metrics
 
@@ -488,8 +628,37 @@ def collect_status() -> Dict[str, Any]:
         "mode": mode,
         "metrics": metrics,
         "exchange": exchange,
+        "position_alignment": _position_alignment(
+            metrics.get("open_position"),
+            exchange.get("position"),
+        ),
     }
     return status
+
+
+def _fmt_llm_field(llm: Optional[Dict[str, Any]], key: str, default: str = "N/A") -> str:
+    if not isinstance(llm, dict):
+        return default
+    val = llm.get(key)
+    if val is None:
+        return default
+    if isinstance(val, str) and not val.strip():
+        return default
+    return str(val)
+
+
+def _base_asset_label(instrument_id: str, exchange_symbol: Optional[str]) -> str:
+    if exchange_symbol and isinstance(exchange_symbol, str):
+        if exchange_symbol.endswith("USDT") and len(exchange_symbol) > 4:
+            return exchange_symbol[:-4]
+        if exchange_symbol.endswith("USD") and len(exchange_symbol) > 3:
+            return exchange_symbol[:-3]
+        return exchange_symbol
+    head = str(instrument_id or "").split("-", 1)[0]
+    for suffix in ("USDT", "USD", "USDC"):
+        if head.endswith(suffix) and len(head) > len(suffix):
+            return head[: -len(suffix)]
+    return head or "ASSET"
 
 
 def _render_html(status: Dict[str, Any]) -> str:
@@ -499,16 +668,66 @@ def _render_html(status: Dict[str, Any]) -> str:
     ex = status.get("exchange") or {}
     sig = m["last_signal"] or {"signal": "N/A", "confidence": "N/A"}
     pos = m["open_position"]
+    llm = m.get("current_llm")
+    bar = m.get("bar_close") or {}
+    align = status.get("position_alignment") or {}
     ex_wallet = ex.get("wallet") or {}
     ex_position = ex.get("position")
     ex_trade_summary = ex.get("recent_trade_summary") or {}
+    asset_label = _base_asset_label(mode.get("instrument_id", ""), ex.get("symbol"))
 
-    pos_html = (
-        f"<b>{pos['side']}</b> {pos['quantity']:.6f} BTC"
-        + (f" @ ${pos['entry_price']:,.2f}" if isinstance(pos.get("entry_price"), (int, float)) else "")
-        if pos
-        else "No open position"
-    )
+    def _pos_line(p: Optional[Dict[str, Any]], asset_label: str) -> str:
+        if not p:
+            return "No open position"
+        side = str(p.get("side") or "").upper()
+        qty = p.get("quantity")
+        entry = p.get("entry_price") or p.get("avg_price")
+        parts = [f"<b>{side}</b>"]
+        if isinstance(qty, (int, float)):
+            parts.append(f"{qty:.6f} {asset_label}")
+        if isinstance(entry, (int, float)):
+            parts.append(f"@ ${entry:,.2f}")
+        upnl = p.get("unrealized_pnl")
+        if isinstance(upnl, (int, float)):
+            parts.append(f"| uPnL {upnl:+.2f}")
+        health = p.get("health")
+        if health:
+            parts.append(f"| {health}")
+        return " ".join(parts)
+
+    pos_html = _pos_line(pos, asset_label)
+    align_state = align.get("state") or "unknown"
+    align_class = "ok" if align_state == "aligned" else ("bad" if align_state in {"side_mismatch", "log_only", "exchange_only"} else "")
+    align_label = {
+        "flat": "Both flat",
+        "aligned": "Log + exchange aligned",
+        "log_only": "Log shows position; exchange flat",
+        "exchange_only": "Exchange position; log flat",
+        "side_mismatch": "Side mismatch",
+    }.get(align_state, align_state)
+
+    llm_regime = _fmt_llm_field(llm, "regime")
+    llm_playbook = _fmt_llm_field(llm, "playbook")
+    llm_action = _fmt_llm_field(llm, "position_action")
+    ob_regime = bar.get("ob_regime") or "N/A"
+    bar_trend = bar.get("trend") or "N/A"
+    thesis = _fmt_llm_field(llm, "thesis", m.get("last_signal_reason") or "N/A")
+    hold_reason = _fmt_llm_field(llm, "hold_reason")
+    setup_type = _fmt_llm_field(llm, "setup_type")
+    watch_trigger = _fmt_llm_field(llm, "watch_trigger")
+    wtp = llm.get("watch_trigger_price") if isinstance(llm, dict) else None
+    wtd = llm.get("watch_trigger_direction") if isinstance(llm, dict) else None
+    wte = llm.get("watch_trigger_expiry_bars") if isinstance(llm, dict) else None
+    if watch_trigger == "N/A" and isinstance(wtp, (int, float)):
+        watch_trigger = f"price={wtp}"
+        if wtd:
+            watch_trigger += f" dir={wtd}"
+        if wte:
+            watch_trigger += f" expiry_bars={wte}"
+    invalidation = _fmt_llm_field(llm, "invalidation")
+    inv_price = llm.get("invalidation_price") if isinstance(llm, dict) else None
+    if invalidation == "N/A" and isinstance(inv_price, (int, float)):
+        invalidation = f"${inv_price:,.2f}"
     last_price = f"${m['last_price']:,.2f}" if isinstance(m["last_price"], (int, float)) else "N/A"
     last_rsi = f"{m['last_rsi']:.2f}" if isinstance(m["last_rsi"], (int, float)) else "N/A"
     pnl = f"{m['realized_pnl_usdt']:.2f}"
@@ -588,11 +807,17 @@ def _render_html(status: Dict[str, Any]) -> str:
       <div class="card">
         <div class="k">Last LLM Signal</div>
         <div class="v">{sig["signal"]} ({sig["confidence"]})</div>
-        <div class="small">API time: {m["last_signal_api_sec"] if m["last_signal_api_sec"] is not None else "N/A"}s</div>
+        <div class="small">Action: {llm_action} | API: {m["last_signal_api_sec"] if m["last_signal_api_sec"] is not None else "N/A"}s</div>
       </div>
       <div class="card">
-        <div class="k">Open Position</div>
+        <div class="k">Regime Identification</div>
+        <div class="v">{llm_regime}</div>
+        <div class="small">Playbook: {llm_playbook} | OB bar regime: {ob_regime} | Bar trend: {bar_trend}</div>
+      </div>
+      <div class="card">
+        <div class="k">Strategy Log Position</div>
         <div class="v">{pos_html}</div>
+        <div class="small"><span class="pill {align_class}">{align_label}</span></div>
       </div>
       <div class="card">
         <div class="k">Session Performance</div>
@@ -605,9 +830,19 @@ def _render_html(status: Dict[str, Any]) -> str:
         <div class="small">Available: {f'${ex_available:,.2f}' if isinstance(ex_available, (int, float)) else 'N/A'} | Initial margin: {f'${ex_margin:,.2f}' if isinstance(ex_margin, (int, float)) else 'N/A'}</div>
       </div>
       <div class="card">
-        <div class="k">Bybit Position</div>
+        <div class="k">Exchange Position (Bybit)</div>
         <div class="v">{ex_pos_html}</div>
         <div class="small">Open orders: {len(ex.get("open_orders") or [])} | Last 5 P&L: {f'{ex_pnl_5:.2f} USDT' if isinstance(ex_pnl_5, (int, float)) else 'N/A'}</div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <div class="k">Current LLM Thinking</div>
+      <div class="small" style="margin-top:8px;line-height:1.5">
+        <div><b>Thesis:</b> {thesis}</div>
+        <div><b>Hold reason:</b> {hold_reason}</div>
+        <div><b>Setup:</b> {setup_type} | <b>Watch trigger:</b> {watch_trigger}</div>
+        <div><b>Invalidation:</b> {invalidation}</div>
       </div>
     </div>
 
@@ -651,13 +886,20 @@ def _render_html(status: Dict[str, Any]) -> str:
     warnList.innerHTML = warns.slice(-8).reverse().map(x => `<li>[${{x.level}}] ${{x.message}}</li>`).join("") || "<li>None</li>";
     eventList.innerHTML = events.slice(-8).reverse().map(x => `<li>${{x.message}}</li>`).join("") || "<li>None</li>";
     pnlList.innerHTML = closedPnl.slice(0, 5).map(x => `<li>${{x.outcome}} ${{x.side}} ${{x.quantity}} | ${{x.closed_pnl}} USDT</li>`).join("") || "<li>None</li>";
+    const synthKeys = ["regime","playbook","position_action","thesis","hold_reason","setup_type","watch_trigger","invalidation"];
+    const fmtSynth = (r) => {{
+      if (!r || typeof r !== "object") return "";
+      return synthKeys.filter(k => r[k]).map(k => `<div><b>${{k}}:</b> ${{r[k]}}</div>`).join("");
+    }};
     llmConvosEl.innerHTML = llmConvos.slice(-5).reverse().map(c => {{
       const prompt = c.prompt_payload ? JSON.stringify(c.prompt_payload) : "N/A";
       const response = c.response_json ? JSON.stringify(c.response_json) : (c.response_raw || "N/A");
       const signal = c.signal ? `${{c.signal.signal}} (${{c.signal.confidence}})` : "N/A";
+      const synth = fmtSynth(c.response_json);
       return `
         <div style="border:1px solid #e5e7eb; border-radius:8px; padding:8px; margin:8px 0;">
           <div><b>Signal:</b> ${{signal}} | <b>API:</b> ${{c.api_time_sec ?? "N/A"}}s</div>
+          ${{synth}}
           <div><b>Prompt payload:</b> <code>${{prompt}}</code></div>
           <div><b>Response:</b> <code>${{response}}</code></div>
         </div>

@@ -1240,6 +1240,7 @@ class DeepSeekAIStrategy(Strategy):
             "open_orders_count": open_orders_count,
             "has_pending_intent": open_orders_count > 0,
             "app_regime": self._app_regime_label(technical_data),
+            "structure_state": self._structure_state(price, technical_data),
             "main_pressure": main_pressure,
             "main_regime_shift": main_shift,
             "main_trade_flow_imbalance": main_trade_flow_imbalance,
@@ -1265,6 +1266,12 @@ class DeepSeekAIStrategy(Strategy):
             return None
         signal = self.last_signal or {}
         candidates: List[float] = []
+        submitted_stop_loss = self._safe_float(signal.get("submitted_stop_loss"))
+        if submitted_stop_loss > 0:
+            candidates.append(submitted_stop_loss)
+        invalidation_price = self._safe_float(signal.get("invalidation_price"))
+        if invalidation_price > 0:
+            candidates.append(invalidation_price)
         stop_loss = self._safe_float(signal.get("stop_loss"))
         if stop_loss > 0:
             candidates.append(stop_loss)
@@ -1282,6 +1289,263 @@ class DeepSeekAIStrategy(Strategy):
             below = [lvl for lvl in candidates if lvl <= current_price]
             selected = max(below) if below else min(candidates)
         return selected if selected > 0 else None
+
+    def _annotate_signal_with_bracket_plan(
+        self,
+        entry_price: float,
+        bracket_plan: Dict[str, Any],
+    ) -> None:
+        updates = {
+            "submitted_entry_price": round(entry_price, 10),
+            "submitted_stop_loss": round(float(bracket_plan["stop_loss_price"]), 10),
+            "submitted_take_profit": round(float(bracket_plan["take_profit_price"]), 10),
+            "bracket_levels_source": bracket_plan.get("levels_source"),
+            "invalidation_price": round(float(bracket_plan["stop_loss_price"]), 10),
+        }
+        deepseek_history = getattr(getattr(self, "deepseek", None), "signal_history", None)
+        for signal in (
+            getattr(self, "latest_signal_data", None),
+            getattr(self, "last_signal", None),
+            deepseek_history[-1] if deepseek_history else None,
+        ):
+            if isinstance(signal, dict):
+                signal.update(updates)
+
+    def _atr_move_threshold(self, price: float, atr: float, atr_fraction: float) -> float:
+        bps_floor = price * 0.0005 if price > 0 else 0.0
+        atr_component = atr_fraction * atr if atr > 0 else 0.0
+        return max(atr_component, bps_floor)
+
+    def _flat_thesis_ttl_bars(self, app_regime: str) -> int:
+        regime = str(app_regime or "range_or_chop")
+        if regime in {"trend_up", "trend_down"}:
+            return 3
+        if regime == "transition":
+            return 4
+        return 6
+
+    def _parse_watch_trigger_spec(self, signal: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        signal = signal or {}
+        trigger_price = self._safe_float(signal.get("watch_trigger_price"))
+        direction = str(signal.get("watch_trigger_direction") or "").strip().lower()
+        expiry_raw = signal.get("watch_trigger_expiry_bars")
+        try:
+            expiry_bars = int(expiry_raw) if expiry_raw is not None else 6
+        except (TypeError, ValueError):
+            expiry_bars = 6
+        expiry_bars = max(1, expiry_bars)
+
+        if trigger_price > 0 and direction:
+            return {
+                "price": trigger_price,
+                "direction": self._normalize_watch_trigger_direction(direction),
+                "expiry_bars": expiry_bars,
+                "source": "structured",
+            }
+
+        text = str(signal.get("watch_trigger") or "").strip()
+        if not text:
+            return None
+
+        lowered = text.lower()
+        if any(token in lowered for token in ("below", "under", "break down", "breakdown", "sell", "short")):
+            direction = "short"
+        elif any(token in lowered for token in ("above", "over", "break up", "breakout", "buy", "long")):
+            direction = "long"
+        else:
+            direction = "unknown"
+
+        numbers = [self._safe_float(raw) for raw in re.findall(r"[-+]?[0-9]*\.?[0-9]+", text)]
+        numbers = [value for value in numbers if value > 0]
+        if not numbers or direction == "unknown":
+            return None
+
+        return {
+            "price": numbers[-1],
+            "direction": direction,
+            "expiry_bars": expiry_bars,
+            "source": "text",
+        }
+
+    @staticmethod
+    def _normalize_watch_trigger_direction(direction: str) -> str:
+        normalized = str(direction or "").strip().lower()
+        if normalized in {"short", "sell", "down", "below"}:
+            return "short"
+        if normalized in {"long", "buy", "up", "above"}:
+            return "long"
+        return normalized
+
+    def _watch_trigger_state(
+        self,
+        signal: Optional[Dict[str, Any]],
+        price: float,
+        atr: float,
+        bars_since_last_llm: Optional[int],
+        last_price: float,
+    ) -> Tuple[bool, bool]:
+        spec = self._parse_watch_trigger_spec(signal)
+        if spec is None:
+            return False, False
+
+        cross_buffer = max(0.15 * atr, price * 0.0005) if atr > 0 and price > 0 else 0.0
+        trigger_price = float(spec["price"])
+        direction = str(spec["direction"])
+        fired = False
+        if direction == "short" and cross_buffer > 0:
+            fired = self._crossed_below_threshold(last_price, price, trigger_price - cross_buffer)
+        elif direction == "long" and cross_buffer > 0:
+            fired = self._crossed_above_threshold(last_price, price, trigger_price + cross_buffer)
+
+        expired = False
+        if bars_since_last_llm is not None and bars_since_last_llm >= int(spec["expiry_bars"]):
+            expired = True
+        return fired, expired
+
+    def _flat_no_action_rearm_reason(
+        self,
+        market_state: Dict[str, Any],
+        previous: Dict[str, Any],
+        price_data: Dict[str, Any],
+    ) -> Optional[str]:
+        position_key = str(market_state.get("position_key") or "flat:0")
+        if not position_key.startswith("flat:"):
+            return None
+
+        last_signal = self.last_signal or {}
+        position_action = str(last_signal.get("position_action") or "").upper()
+        if position_action != "NO_ACTION":
+            return None
+
+        price = self._safe_float(market_state.get("price"))
+        last_price = self._safe_float(previous.get("price"), price)
+        atr = self._safe_float(market_state.get("atr"))
+        app_regime = str(market_state.get("app_regime") or "range_or_chop")
+        bars_since = price_data.get("bars_since_last_llm_decision")
+        try:
+            bars_since_int = int(bars_since) if bars_since is not None else None
+        except (TypeError, ValueError):
+            bars_since_int = None
+
+        ttl_bars = self._flat_thesis_ttl_bars(app_regime)
+        if bars_since_int is not None and bars_since_int >= ttl_bars:
+            return "flat_thesis_ttl_expired"
+
+        fired, expired = self._watch_trigger_state(
+            signal=last_signal,
+            price=price,
+            atr=atr,
+            bars_since_last_llm=bars_since_int,
+            last_price=last_price,
+        )
+        if fired:
+            return "watch_trigger_fired"
+        if expired:
+            return "watch_trigger_expired"
+
+        prev_structure = str(previous.get("structure_state") or "inside_range")
+        now_structure = str(market_state.get("structure_state") or "inside_range")
+        if prev_structure != now_structure:
+            return "structure_state_change"
+
+        continuation_threshold = self._atr_move_threshold(price, atr, 0.35)
+        support_walk_threshold = self._atr_move_threshold(price, atr, 0.20)
+        if app_regime == "trend_down" and continuation_threshold > 0:
+            if (last_price - price) >= continuation_threshold:
+                return "trend_continuation_progress"
+            prev_support = self._safe_float(previous.get("support_12")) or self._safe_float(previous.get("support"))
+            now_support = self._safe_float(market_state.get("support_12")) or self._safe_float(market_state.get("support"))
+            if prev_support > 0 and now_support > 0 and (prev_support - now_support) >= support_walk_threshold:
+                return "support_walk_extension"
+        elif app_regime == "trend_up" and continuation_threshold > 0:
+            if (price - last_price) >= continuation_threshold:
+                return "trend_continuation_progress"
+            prev_resistance = self._safe_float(previous.get("resistance_12")) or self._safe_float(previous.get("resistance"))
+            now_resistance = self._safe_float(market_state.get("resistance_12")) or self._safe_float(market_state.get("resistance"))
+            if prev_resistance > 0 and now_resistance > 0 and (now_resistance - prev_resistance) >= support_walk_threshold:
+                return "resistance_walk_extension"
+
+        return None
+
+    def _stop_risk_bounds(self, entry_price: float, atr: float) -> Tuple[float, float]:
+        if entry_price <= 0:
+            return 0.0, 0.0
+        floor = max(1.2 * atr, entry_price * 0.004) if atr > 0 else entry_price * 0.004
+        cap = min(3.0 * atr, entry_price * 0.02) if atr > 0 else entry_price * 0.02
+        return floor, cap
+
+    def _required_min_rr_for_risk_pct(self, risk_pct: float) -> float:
+        if risk_pct <= 0.5:
+            return 0.5
+        if risk_pct <= 1.0:
+            return 0.75
+        return 1.0
+
+    def _estimate_round_trip_friction_pct(self) -> float:
+        micro = (self.latest_price_data or {}).get("microstructure") or {}
+        spread_bps = self._safe_float(micro.get("spread_bps"))
+        return (13.0 + max(0.0, spread_bps)) / 10000.0
+
+    def _net_r_multiple(
+        self,
+        entry_price: float,
+        risk_per_unit: float,
+        reward_per_unit: float,
+    ) -> float:
+        if entry_price <= 0 or risk_per_unit <= 0:
+            return 0.0
+        friction = entry_price * self._estimate_round_trip_friction_pct()
+        net_reward = reward_per_unit - friction
+        net_risk = risk_per_unit + friction
+        if net_risk <= 0:
+            return 0.0
+        return net_reward / net_risk
+
+    def _validate_bracket_geometry(
+        self,
+        side: OrderSide,
+        entry_price: float,
+        stop_loss_price: float,
+        tp_price: float,
+        atr: float,
+    ) -> Optional[Dict[str, Any]]:
+        if entry_price <= 0:
+            return None
+        if side == OrderSide.BUY:
+            risk_per_unit = entry_price - stop_loss_price
+            reward_per_unit = tp_price - entry_price
+        else:
+            risk_per_unit = stop_loss_price - entry_price
+            reward_per_unit = entry_price - tp_price
+        if risk_per_unit <= 0 or reward_per_unit <= 0:
+            return None
+
+        floor, cap = self._stop_risk_bounds(entry_price, atr)
+        if floor > 0 and risk_per_unit < floor:
+            return None
+        if cap > 0 and risk_per_unit > cap:
+            return None
+
+        gross_rr = reward_per_unit / risk_per_unit
+        risk_pct = (risk_per_unit / entry_price) * 100.0
+        required_rr = max(self.min_entry_rr, self._required_min_rr_for_risk_pct(risk_pct))
+        if gross_rr < required_rr:
+            return None
+
+        net_rr = self._net_r_multiple(entry_price, risk_per_unit, reward_per_unit)
+        if net_rr < required_rr:
+            return None
+
+        reward_pct = (reward_per_unit / entry_price) * 100.0
+        return {
+            "risk_per_unit": risk_per_unit,
+            "reward_per_unit": reward_per_unit,
+            "risk_pct": risk_pct,
+            "reward_pct": reward_pct,
+            "rr": gross_rr,
+            "net_rr": net_rr,
+            "required_rr": required_rr,
+        }
 
     @staticmethod
     def _crossed_outside_band(previous_value: float, current_value: float, neutral_abs: float) -> bool:
@@ -1368,6 +1632,14 @@ class DeepSeekAIStrategy(Strategy):
         now_shift = str(market_state.get("main_regime_shift") or "unknown")
         if (prev_shift == "transitioning") != (now_shift == "transitioning"):
             return True, "hard_regime_flip"
+
+        flat_rearm_reason = self._flat_no_action_rearm_reason(
+            market_state=market_state,
+            previous=previous,
+            price_data=price_data,
+        )
+        if flat_rearm_reason:
+            return True, flat_rearm_reason
 
         return False, "no_material_market_change"
 
@@ -1864,18 +2136,16 @@ class DeepSeekAIStrategy(Strategy):
             current_qty = float(current_position.get("quantity") or 0.0)
 
             if action == "EXIT_NOW":
-                exit_side = OrderSide.SELL if current_side == "long" else OrderSide.BUY
-                self._submit_order(side=exit_side, quantity=current_qty, reduce_only=True)
-                self.log.info(
-                    f"🛡️ LLM EXIT_NOW: closing {current_side} {current_qty:.6g} "
-                    f"{self.base_asset} with one reduce-only order"
+                self._log_warning_safe(
+                    "⚠️ Ignoring EXIT_NOW while bracket-owned position is open; "
+                    "holding position until bracket SL/TP or later flat-state decision"
                 )
                 return {
-                    "status": "submitted",
-                    "action": "exit_now",
-                    "target_side": "flat",
-                    "target_quantity": 0.0,
-                    "note": "llm_exit_now_reduce_only",
+                    "status": "hold",
+                    "action": "hold_position",
+                    "target_side": current_side,
+                    "target_quantity": current_qty,
+                    "note": "exit_now_ignored_while_exposed",
                 }
 
             if action in {"HOLD_POSITION", "NO_ACTION"}:
@@ -1904,8 +2174,7 @@ class DeepSeekAIStrategy(Strategy):
             self._log_info_safe(f"📊 Action: {action} while flat - no action taken")
             return {"status": "hold", "action": "none", "note": f"flat_{action.lower()}"}
 
-        # Confidence gating applies to new exposure only. EXIT_NOW above always
-        # remains available as a risk-reducing action.
+        # Confidence gating applies to new exposure only.
         confidence_levels = {'LOW': 0, 'MEDIUM': 1, 'HIGH': 2}
         min_conf_level = confidence_levels.get(self.min_confidence, 1)
         signal_conf_level = confidence_levels.get(confidence, 1)
@@ -2060,7 +2329,6 @@ class DeepSeekAIStrategy(Strategy):
         - Stop loss: STOP_MARKET at structural invalidation (support/resistance)
         - Take profit: LIMIT at nearest viable structural target (min R:R gate)
 
-        EXIT_NOW uses ``_submit_order`` (MARKET, reduce-only) in v1.
         """
         order_side = OrderSide.BUY if side == 'long' else OrderSide.SELL
 
@@ -2211,6 +2479,7 @@ class DeepSeekAIStrategy(Strategy):
         confidence = self.latest_signal_data.get('confidence', 'MEDIUM')
 
         bracket_plan = self._build_entry_bracket_plan(side, entry_price, quantity)
+        self._annotate_signal_with_bracket_plan(entry_price, bracket_plan)
 
         stop_loss_price = bracket_plan["stop_loss_price"]
         tp_price = bracket_plan["take_profit_price"]
@@ -2349,18 +2618,20 @@ class DeepSeekAIStrategy(Strategy):
         except (TypeError, ValueError):
             return None
 
-        if side == OrderSide.BUY:
-            risk_per_unit = entry_price - stop_loss_price
-            reward_per_unit = tp_price - entry_price
-        else:
-            risk_per_unit = stop_loss_price - entry_price
-            reward_per_unit = entry_price - tp_price
-        if risk_per_unit <= 0 or reward_per_unit <= 0:
+        atr = self._safe_float((self.latest_technical_data or {}).get("atr"))
+        geometry = self._validate_bracket_geometry(
+            side=side,
+            entry_price=entry_price,
+            stop_loss_price=stop_loss_price,
+            tp_price=tp_price,
+            atr=atr,
+        )
+        if geometry is None:
             return None
 
-        rr = reward_per_unit / risk_per_unit
-        if rr < self.min_entry_rr:
-            return None
+        risk_per_unit = float(geometry["risk_per_unit"])
+        reward_per_unit = float(geometry["reward_per_unit"])
+        rr = float(geometry["rr"])
 
         return {
             "valid": True,
@@ -2372,8 +2643,10 @@ class DeepSeekAIStrategy(Strategy):
             "target_source": "llm",
             "target_r": rr,
             "rr": rr,
-            "risk_pct": (risk_per_unit / entry_price) * 100.0,
-            "reward_pct": (reward_per_unit / entry_price) * 100.0,
+            "net_rr": float(geometry["net_rr"]),
+            "required_rr": float(geometry["required_rr"]),
+            "risk_pct": float(geometry["risk_pct"]),
+            "reward_pct": float(geometry["reward_pct"]),
             "risk_usdt": risk_per_unit * quantity,
             "notional_usdt": entry_price * quantity,
             "candidates": [],
@@ -2461,6 +2734,23 @@ class DeepSeekAIStrategy(Strategy):
             risk_per_unit = stop_loss_price - entry_price
             direction = -1.0
 
+        atr = self._safe_float(tech.get("atr"))
+        floor, cap = self._stop_risk_bounds(entry_price, atr)
+        if floor > 0 and risk_per_unit < floor:
+            return {
+                "valid": False,
+                "note": "stop_below_atr_floor",
+                "entry_price": entry_price,
+                "stop_loss_price": stop_loss_price,
+            }
+        if cap > 0 and risk_per_unit > cap:
+            return {
+                "valid": False,
+                "note": "stop_above_atr_cap",
+                "entry_price": entry_price,
+                "stop_loss_price": stop_loss_price,
+            }
+
         if risk_per_unit <= 0:
             return {
                 "valid": False,
@@ -2470,7 +2760,8 @@ class DeepSeekAIStrategy(Strategy):
             }
 
         target_r = self._target_r_from_signal()
-        min_reward = self.min_entry_rr * risk_per_unit
+        risk_pct = (risk_per_unit / entry_price) * 100.0 if entry_price > 0 else 0.0
+        required_rr = max(self.min_entry_rr, self._required_min_rr_for_risk_pct(risk_pct))
         desired_reward = target_r * risk_per_unit
         candidates = []
         for source, target in self._structural_target_candidates(side, entry_price):
@@ -2479,14 +2770,25 @@ class DeepSeekAIStrategy(Strategy):
                 continue
             candidates.append((source, target, reward / risk_per_unit, reward))
 
-        viable = [c for c in candidates if c[3] >= min_reward]
+        viable = []
+        for source, target, gross_rr, reward in candidates:
+            geometry = self._validate_bracket_geometry(
+                side=side,
+                entry_price=entry_price,
+                stop_loss_price=stop_loss_price,
+                tp_price=target,
+                atr=atr,
+            )
+            if geometry is not None:
+                viable.append((source, target, float(geometry["rr"]), reward))
+
         if not viable:
             return {
                 "valid": False,
-                "note": f"no_structural_target_with_min_rr:{self.min_entry_rr:.2f}",
+                "note": f"no_structural_target_with_min_rr:{required_rr:.2f}",
                 "entry_price": entry_price,
                 "stop_loss_price": stop_loss_price,
-                "risk_pct": (risk_per_unit / entry_price) * 100.0,
+                "risk_pct": risk_pct,
                 "target_r": target_r,
                 "candidates": candidates,
             }
@@ -2494,6 +2796,7 @@ class DeepSeekAIStrategy(Strategy):
         preferred = [c for c in viable if c[3] >= desired_reward]
         selected = min(preferred or viable, key=lambda item: item[3])
         source, tp_price, rr, reward_per_unit = selected
+        net_rr = self._net_r_multiple(entry_price, risk_per_unit, reward_per_unit)
         notional = quantity * entry_price
         risk_usdt = risk_per_unit * quantity
         return {
@@ -2505,7 +2808,9 @@ class DeepSeekAIStrategy(Strategy):
             "target_source": source,
             "target_r": target_r,
             "rr": rr,
-            "risk_pct": (risk_per_unit / entry_price) * 100.0,
+            "net_rr": net_rr,
+            "required_rr": required_rr,
+            "risk_pct": risk_pct,
             "reward_pct": (reward_per_unit / entry_price) * 100.0,
             "risk_usdt": risk_usdt,
             "notional_usdt": notional,
@@ -2527,7 +2832,13 @@ class DeepSeekAIStrategy(Strategy):
             f"(ID: {filled_order_id[:8]}...)"
         )
         is_reduce_only = bool(getattr(event, "reduce_only", False) or getattr(event, "is_reduce_only", False))
-        self._force_next_llm_reason = "tp_or_sl_filled" if is_reduce_only else "entry_filled"
+        if is_reduce_only:
+            self._force_next_llm_reason = "tp_or_sl_filled"
+        else:
+            self.log.info(
+                "📌 Entry fill observed under bracket ownership; "
+                "not forcing immediate next-bar LLM re-analysis"
+            )
 
         # Send Telegram order fill notification
         if self.telegram_bot and self.enable_telegram and self.telegram_notify_fills:
@@ -2565,7 +2876,6 @@ class DeepSeekAIStrategy(Strategy):
             f"🟢 Position opened: {event.side.name} "
             f"{event.quantity} @ {event.avg_px_open}"
         )
-        self._force_next_llm_reason = "position_opened"
 
         # Update trailing stop state with actual entry price if it exists
         # (bracket order already initialized it with estimated price)

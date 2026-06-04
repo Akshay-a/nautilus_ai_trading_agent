@@ -167,7 +167,8 @@ class DeepSeekAnalyzer:
             "4. Do not exit on small giveback alone; exit only on invalidation hit, clear structure failure, confirmed reversal, "
             "or large opposing micro shift with price moving toward invalidation.\n"
             "5. Reject friction-sized churn: if expected move is not clearly beyond round-trip friction, prefer NO_ACTION.\n"
-            "6. HOLD/NO_ACTION is correct when the prior thesis remains valid or edge is mixed.\n\n"
+            "6. Flat waits use NO_ACTION; in-position intact thesis uses HOLD_POSITION — do not conflate them.\n"
+            "7. In TREND_UP/TREND_DOWN while flat, NO_ACTION needs a named disqualifier in hold_reason; mixed RSI/levels alone are insufficient.\n\n"
             "BYBIT EXCHANGE POSITION/OPEN_ORDERS IS THE SOURCE OF TRUTH for actual exposure state.\n\n"
             "Respond ONLY in English. Output a single JSON object. No markdown, no prose outside JSON."
         )
@@ -221,8 +222,22 @@ class DeepSeekAnalyzer:
             "risk_assessment",
             "thesis",
             "invalidation",
+            "invalidation_price",
             "execution_note",
+            "playbook",
+            "watch_trigger",
+            "watch_trigger_price",
+            "watch_trigger_direction",
+            "watch_trigger_expiry_bars",
+            "hold_reason",
+            "setup_type",
+            "thesis_state",
+            "prior_trigger_status",
             "target_r",
+            "submitted_entry_price",
+            "submitted_stop_loss",
+            "submitted_take_profit",
+            "bracket_levels_source",
             "timestamp",
         )
         compact = {k: previous.get(k) for k in keys if k in previous}
@@ -361,6 +376,112 @@ class DeepSeekAnalyzer:
             signal_data["thesis"] = legacy
         signal_data.setdefault("trend_strength", "MODERATE")
 
+        invalidation_price_raw = signal_data.get("invalidation_price")
+        if invalidation_price_raw not in (None, ""):
+            try:
+                invalidation_price = float(invalidation_price_raw)
+            except (TypeError, ValueError):
+                self._log_warning("⚠️ Invalid invalidation_price from LLM, dropping field")
+                signal_data.pop("invalidation_price", None)
+            else:
+                if invalidation_price > 0:
+                    signal_data["invalidation_price"] = invalidation_price
+                else:
+                    signal_data.pop("invalidation_price", None)
+
+    _VALID_THESIS_STATES = frozenset(
+        {"INTACT", "INVALIDATED", "EXPIRED", "PENDING", "N_A"}
+    )
+    _VALID_PRIOR_TRIGGER_STATUS = frozenset(
+        {"FIRED", "EXPIRED", "UNFIRED", "NOT_SET"}
+    )
+
+    @staticmethod
+    def _normalize_watch_trigger_direction(direction: str) -> str:
+        normalized = str(direction or "").strip().lower()
+        if normalized in {"short", "sell", "down", "below"}:
+            return "short"
+        if normalized in {"long", "buy", "up", "above"}:
+            return "long"
+        return ""
+
+    def _normalize_trend_participation_fields(self, signal_data: Dict[str, Any]) -> None:
+        """Normalize optional trend-participation fields; drop invalid values safely."""
+        for key, max_len in (("hold_reason", 240), ("setup_type", 80)):
+            raw = signal_data.get(key)
+            if raw is None:
+                continue
+            text = str(raw).strip()
+            if not text:
+                signal_data.pop(key, None)
+                continue
+            signal_data[key] = text[:max_len]
+
+        thesis_state = str(signal_data.get("thesis_state") or "").strip().upper()
+        if thesis_state:
+            if thesis_state in self._VALID_THESIS_STATES:
+                signal_data["thesis_state"] = thesis_state
+            else:
+                self._log_warning(f"⚠️ Invalid thesis_state={thesis_state!r}, dropping field")
+                signal_data.pop("thesis_state", None)
+        elif "thesis_state" in signal_data:
+            signal_data.pop("thesis_state", None)
+
+        prior_status = str(signal_data.get("prior_trigger_status") or "").strip().upper()
+        if prior_status:
+            if prior_status in self._VALID_PRIOR_TRIGGER_STATUS:
+                signal_data["prior_trigger_status"] = prior_status
+            else:
+                self._log_warning(
+                    f"⚠️ Invalid prior_trigger_status={prior_status!r}, dropping field"
+                )
+                signal_data.pop("prior_trigger_status", None)
+        elif "prior_trigger_status" in signal_data:
+            signal_data.pop("prior_trigger_status", None)
+
+        trigger_price_raw = signal_data.get("watch_trigger_price")
+        if trigger_price_raw not in (None, ""):
+            try:
+                trigger_price = float(trigger_price_raw)
+            except (TypeError, ValueError):
+                self._log_warning("⚠️ Invalid watch_trigger_price from LLM, dropping field")
+                signal_data.pop("watch_trigger_price", None)
+            else:
+                if trigger_price > 0:
+                    signal_data["watch_trigger_price"] = trigger_price
+                else:
+                    signal_data.pop("watch_trigger_price", None)
+
+        direction_raw = signal_data.get("watch_trigger_direction")
+        if direction_raw not in (None, ""):
+            direction = self._normalize_watch_trigger_direction(str(direction_raw))
+            if direction:
+                signal_data["watch_trigger_direction"] = direction
+            else:
+                self._log_warning(
+                    f"⚠️ Invalid watch_trigger_direction={direction_raw!r}, dropping field"
+                )
+                signal_data.pop("watch_trigger_direction", None)
+
+        expiry_raw = signal_data.get("watch_trigger_expiry_bars")
+        if expiry_raw not in (None, ""):
+            try:
+                expiry_bars = int(expiry_raw)
+            except (TypeError, ValueError):
+                self._log_warning(
+                    "⚠️ Invalid watch_trigger_expiry_bars from LLM, dropping field"
+                )
+                signal_data.pop("watch_trigger_expiry_bars", None)
+            else:
+                if expiry_bars >= 1:
+                    signal_data["watch_trigger_expiry_bars"] = expiry_bars
+                else:
+                    signal_data.pop("watch_trigger_expiry_bars", None)
+
+        watch_text = signal_data.get("watch_trigger")
+        if watch_text is not None and not str(watch_text).strip():
+            signal_data.pop("watch_trigger", None)
+
     def _analyze_with_retry(
         self,
         price_data: Dict[str, Any],
@@ -446,11 +567,15 @@ class DeepSeekAnalyzer:
             return self._emit_fallback(price_data)
 
         position_action = str(signal_data.get("position_action") or "").upper()
+        if position_action == "EXIT_NOW":
+            self._log_warning(
+                "⚠️ Received deprecated position_action=EXIT_NOW; coercing to HOLD_POSITION"
+            )
+            position_action = "HOLD_POSITION"
         valid_actions = {
             "ENTER_LONG",
             "ENTER_SHORT",
             "HOLD_POSITION",
-            "EXIT_NOW",
             "NO_ACTION",
         }
         if position_action not in valid_actions:
@@ -481,6 +606,7 @@ class DeepSeekAnalyzer:
                     "MEDIUM" if fld == "risk_assessment" else "",
                 )
 
+        self._normalize_trend_participation_fields(signal_data)
         self._finalize_signal_compat(signal_data, price_data)
 
         if "partial_close_pct" in signal_data:
@@ -676,6 +802,24 @@ class DeepSeekAnalyzer:
         spread_bps = max(0.0, spread_bps)
         return self.ROUND_TRIP_FEE_BPS + spread_bps + self.SLIPPAGE_BUFFER_BPS
 
+    def _format_friction_context(
+        self,
+        price_data: Dict[str, Any],
+        current_position: Optional[Dict[str, Any]],
+    ) -> str:
+        friction_bps = self._estimate_round_trip_friction_bps(price_data)
+        if current_position and isinstance(current_position, dict) and current_position.get("side"):
+            exit_bps = friction_bps / 2.0
+            return (
+                f"FRICTION exit_only~={exit_bps:.1f}bps "
+                f"(~{exit_bps / 100:.3f}% move needed on the exit leg to justify a discretionary close; "
+                "do not churn an intact thesis for sub-friction noise)"
+            )
+        return (
+            f"FRICTION round_trip~={friction_bps:.1f}bps "
+            f"(~{friction_bps / 100:.3f}% gross move just to break even; need gross profit clearly above this to net positive)"
+        )
+
     def _build_analysis_prompt(
         self,
         price_data: Dict[str, Any],
@@ -718,12 +862,8 @@ class DeepSeekAnalyzer:
         # Position health context for scalp-aware decision making
         position_health_text = self._format_position_health(current_position)
 
-        # Concrete round-trip cost so the model can size net edge vs gross move.
-        friction_bps = self._estimate_round_trip_friction_bps(price_data)
-        friction_text = (
-            f"FRICTION round_trip~={friction_bps:.1f}bps (~{friction_bps / 100:.3f}% "
-            "gross move just to break even; need gross profit clearly above this to net positive)"
-        )
+        # Concrete trading cost so the model can size net edge vs gross move.
+        friction_text = self._format_friction_context(price_data, current_position)
         risk_unit_text = self._format_risk_unit_context(price_data)
 
         prompt = (
@@ -755,6 +895,8 @@ class DeepSeekAnalyzer:
             "TP toward opposing range edge or conservative structural target. Mid-range -> prefer NO_ACTION.\n"
             "- TREND: prefer continuation/pullback participation. Hold while invalidation remains intact. "
             "Do not exit from one pause or partial retrace.\n"
+            "- In TREND_DOWN, support or oversold RSI alone is not a veto. Valid short continuation setups include failed bounces, lower highs below resistance, support-walk behavior, and clean breakdowns with sell-heavy flow.\n"
+            "- In TREND_UP, resistance or overbought RSI alone is not a veto. Prefer continuation/pullback longs while structure remains intact.\n"
             "- TRANSITION: default NO_ACTION unless both structure and flow confirm breakout.\n"
             "- Do not flip from trend_up/trend_down to range from one bar drift unless structure actually breaks.\n"
             "- If already in position, do not exit because of small giveback alone.\n"
@@ -763,21 +905,39 @@ class DeepSeekAnalyzer:
             "- If expected move from current price is not clearly larger than round-trip friction, do not enter.\n"
             "- If in a trade and PnL is still within friction noise, do not force exit unless invalidation is threatened.\n"
             "- If flat: enter only when structure + volume + liquidity imply a clean directional move worth the risk.\n"
+            "- Flat waits: position_action=NO_ACTION with signal=HOLD. In-position intact thesis: position_action=HOLD_POSITION with signal=HOLD — never use NO_ACTION while exposed.\n"
+            "- When flat in TREND_UP or TREND_DOWN, NO_ACTION carries burden-of-proof: hold_reason must name a specific disqualifier "
+            "(e.g. sub-friction edge, no clean trigger level, structure conflict with flow). Mixed RSI, support, or resistance alone is NOT sufficient.\n"
+            "- In RANGE or TRANSITION, mixed or low-quality evidence may justify flat NO_ACTION without a trend disqualifier.\n"
+            "- If choosing flat NO_ACTION, set structured watch_trigger_price, watch_trigger_direction (long|short), and watch_trigger_expiry_bars; "
+            "watch_trigger free text is optional color only — structured fields are authoritative for re-arm logic.\n"
+            "- If PRIOR_DECISION had a watch trigger, set prior_trigger_status to FIRED, EXPIRED, or UNFIRED and adjudicate it in thesis — "
+            "do not restate the same wait thesis without checking whether the trigger fired or expired.\n"
+            "- Do not use recent losses alone as the main veto against a structurally valid trade.\n"
             "- For ENTER_LONG or ENTER_SHORT, provide explicit numeric stop_loss and take_profit prices.\n"
-            "- EXIT_NOW means close the current position only. Never imply or request an automatic reversal.\n"
-            "- Entry actions are valid only while flat. While exposed choose HOLD_POSITION or EXIT_NOW.\n"
+            "- Provide numeric invalidation_price whenever possible so the next review can anchor to the actual thesis failure level.\n"
+            "- Entry actions are valid only while flat. While exposed choose HOLD_POSITION.\n"
             "- If exchange/local state looks conflicting or stale, prefer HOLD and wait for confirmation.\n"
-            "- If exchange_position in RISK is flat, treat exposure as flat (do not act as if position exists).\n"
-            "- If evidence is mixed or low quality, HOLD (NO_ACTION).\n\n"
+            "- If exchange_position in RISK is flat, treat exposure as flat (do not act as if position exists).\n\n"
             "Output: single JSON object in English, no markdown.\n"
-            'Schema (all string values except numeric target_r/stop_loss/take_profit):\n'
+            'Schema (string values except numeric target_r/stop_loss/take_profit/invalidation_price/watch_trigger_price/watch_trigger_expiry_bars):\n'
             "{\n"
             '  "signal": "BUY|SELL|HOLD",\n'
-            '  "position_action": "ENTER_LONG|ENTER_SHORT|HOLD_POSITION|EXIT_NOW|NO_ACTION",\n'
+            '  "position_action": "ENTER_LONG|ENTER_SHORT|HOLD_POSITION|NO_ACTION",\n'
             '  "confidence": "HIGH|MEDIUM|LOW",\n'
             '  "regime": "short label",\n'
+            '  "playbook": "TREND_UP|TREND_DOWN|RANGE|TRANSITION",\n'
+            '  "setup_type": "continuation_pullback|breakdown|failed_bounce|range_extreme|none",\n'
+            '  "thesis_state": "INTACT|INVALIDATED|EXPIRED|PENDING|N_A",\n'
             '  "thesis": "compact reasoning IN ENGLISH",\n'
+            '  "hold_reason": "named disqualifier when flat NO_ACTION in TREND_*; else brief or empty",\n'
             '  "invalidation": "what would prove this wrong",\n'
+            '  "invalidation_price": 0,\n'
+            '  "prior_trigger_status": "FIRED|EXPIRED|UNFIRED|NOT_SET",\n'
+            '  "watch_trigger_price": 0,\n'
+            '  "watch_trigger_direction": "long|short",\n'
+            '  "watch_trigger_expiry_bars": 0,\n'
+            '  "watch_trigger": "optional free-text color; structured trigger fields are authoritative",\n'
             '  "execution_note": "scaling/spread/friction-aware note",\n'
             '  "volume_note": "volume context",\n'
             '  "risk_assessment": "LOW|MEDIUM|HIGH",\n'
@@ -786,9 +946,9 @@ class DeepSeekAnalyzer:
             '  "stop_loss": 0,\n'
             '  "take_profit": 0\n'
             "}\n"
-            "BUY pairs with ENTER_LONG. SELL pairs with ENTER_SHORT. HOLD pairs with NO_ACTION, HOLD_POSITION, or EXIT_NOW.\n"
+            "BUY pairs with ENTER_LONG. SELL pairs with ENTER_SHORT. Flat HOLD uses NO_ACTION; exposed HOLD uses HOLD_POSITION.\n"
             "For entries, stop_loss and take_profit are required numeric prices. For non-entry actions they may be omitted.\n"
-            "HOLD is allowed when evidence conflicts; avoid inventing precise SL/TP.\n"
+            "Avoid inventing precise SL/TP on pure waits; in TREND_* flat NO_ACTION must still include hold_reason and structured watch fields when waiting.\n"
         )
         return prompt
 
@@ -800,22 +960,49 @@ class DeepSeekAnalyzer:
         thesis = str(previous.get("thesis") or previous.get("reason") or "")
         invalidation = str(previous.get("invalidation") or "")
         execution_note = str(previous.get("execution_note") or "")
+        playbook = str(previous.get("playbook") or "")
+        watch_trigger = str(previous.get("watch_trigger") or "")
+        hold_reason = str(previous.get("hold_reason") or "")
+        setup_type = str(previous.get("setup_type") or "")
+        thesis_state = str(previous.get("thesis_state") or "")
+        prior_trigger_status = str(previous.get("prior_trigger_status") or "")
+        watch_trigger_price = previous.get("watch_trigger_price")
+        watch_trigger_direction = previous.get("watch_trigger_direction")
+        watch_trigger_expiry_bars = previous.get("watch_trigger_expiry_bars")
         if len(thesis) > 320:
             thesis = thesis[:320] + "..."
         if len(invalidation) > 220:
             invalidation = invalidation[:220] + "..."
         if len(execution_note) > 180:
             execution_note = execution_note[:180] + "..."
+        if len(watch_trigger) > 180:
+            watch_trigger = watch_trigger[:180] + "..."
+        if len(hold_reason) > 180:
+            hold_reason = hold_reason[:180] + "..."
+        entry_price = previous.get("submitted_entry_price")
+        stop_loss = previous.get("submitted_stop_loss", previous.get("stop_loss"))
+        take_profit = previous.get("submitted_take_profit", previous.get("take_profit"))
+        invalidation_price = previous.get("invalidation_price")
         return (
             "PRIOR_DECISION\n"
             f"bars_since={bars_since if bars_since is not None else 'unknown'} "
             f"signal={previous.get('signal')} action={previous.get('position_action')} "
             f"conf={previous.get('confidence')} regime={previous.get('regime')} "
-            f"target_r={previous.get('target_r')}\n"
+            f"playbook={playbook or 'n/a'} target_r={previous.get('target_r')}\n"
             f"prior_thesis={thesis}\n"
             f"prior_invalidation={invalidation}\n"
+            f"prior_invalidation_price={invalidation_price if invalidation_price not in (None, '') else 'n/a'}\n"
+            f"prior_levels entry={entry_price if entry_price not in (None, '') else 'n/a'} "
+            f"sl={stop_loss if stop_loss not in (None, '') else 'n/a'} "
+            f"tp={take_profit if take_profit not in (None, '') else 'n/a'}\n"
+            f"prior_watch_trigger={watch_trigger or 'n/a'}\n"
+            f"prior_watch_structured price={watch_trigger_price if watch_trigger_price not in (None, '') else 'n/a'} "
+            f"dir={watch_trigger_direction if watch_trigger_direction not in (None, '') else 'n/a'} "
+            f"expiry_bars={watch_trigger_expiry_bars if watch_trigger_expiry_bars not in (None, '') else 'n/a'}\n"
+            f"prior_hold_reason={hold_reason or 'n/a'} setup_type={setup_type or 'n/a'} "
+            f"thesis_state={thesis_state or 'n/a'} prior_trigger_status={prior_trigger_status or 'n/a'}\n"
             f"prior_execution_note={execution_note}\n"
-            "Use this to decide whether the trigger invalidates, confirms, or leaves the prior thesis unchanged."
+            "Adjudicate whether the prior watch trigger fired or expired; do not repeat the same wait thesis without that check."
         )
 
     @staticmethod

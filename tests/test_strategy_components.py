@@ -18,6 +18,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 
+def _nautilus_trader_available() -> bool:
+    try:
+        return importlib.util.find_spec("nautilus_trader") is not None
+    except (ValueError, ImportError):
+        return "nautilus_trader" in sys.modules
+
+
 def _load_deepseek_strategy_module():
     path = ROOT / "strategy" / "deepseek_strategy.py"
     spec = importlib.util.spec_from_file_location("deepseek_strategy_standalone", path)
@@ -28,7 +35,7 @@ def _load_deepseek_strategy_module():
 
 
 @pytest.mark.skipif(
-    importlib.util.find_spec("nautilus_trader") is None,
+    not _nautilus_trader_available(),
     reason="nautilus_trader not installed",
 )
 def test_position_sizing_respects_minimum_notional():
@@ -73,7 +80,7 @@ def test_position_sizing_respects_minimum_notional():
 
 
 @pytest.mark.skipif(
-    importlib.util.find_spec("nautilus_trader") is None,
+    not _nautilus_trader_available(),
     reason="nautilus_trader not installed",
 )
 def test_position_sizing_uses_fixed_margin_times_leverage_without_confidence_scaling():
@@ -179,6 +186,155 @@ def test_deepseek_synthesis_parse_and_journal_fields():
     assert result["thesis"]
     assert result.get("reason") == result["thesis"]
     assert "stop_loss" in result and "take_profit" in result
+
+
+def test_deepseek_coerces_deprecated_exit_now_to_hold_position():
+    import types
+
+    synth = {
+        "signal": "HOLD",
+        "position_action": "EXIT_NOW",
+        "confidence": "MEDIUM",
+        "regime": "range_compress",
+        "thesis": "Thesis unchanged; continue holding bracket-owned exposure.",
+        "invalidation": "Break and close beyond invalidation level.",
+        "execution_note": "No new action.",
+        "volume_note": "neutral",
+        "risk_assessment": "MEDIUM",
+        "trend_strength": "MODERATE",
+    }
+
+    openai_fake = types.ModuleType("openai")
+    MockOpenAI = Mock()
+    openai_fake.OpenAI = MockOpenAI
+
+    mock_client = MockOpenAI.return_value
+    mock_choice = Mock()
+    mock_choice.message.content = json.dumps(synth)
+    mock_choice.message.reasoning_content = "exit-now-legacy"
+    mock_client.chat.completions.create.return_value = Mock(choices=[mock_choice])
+
+    spec_ds = importlib.util.spec_from_file_location(
+        "deepseek_standalone_mod_exit_now", ROOT / "utils" / "deepseek_client.py"
+    )
+    assert spec_ds and spec_ds.loader
+
+    prev_mod = sys.modules.get("deepseek_standalone_mod_exit_now")
+    openai_prev = sys.modules.get("openai")
+    try:
+        sys.modules["openai"] = openai_fake
+        ds_mod = importlib.util.module_from_spec(spec_ds)
+        sys.modules["deepseek_standalone_mod_exit_now"] = ds_mod
+        spec_ds.loader.exec_module(ds_mod)
+        DeepSeekAnalyzer = ds_mod.DeepSeekAnalyzer
+        client = DeepSeekAnalyzer(
+            api_key="k", model="m", instrument_id="X-LINEAR.BYBIT", bar_type="X-5-MINUTE-LAST"
+        )
+        result = client.analyze(
+            {
+                "price": 100.0,
+                "high": 100.2,
+                "low": 99.8,
+                "volume": 12.0,
+                "price_change": 0.1,
+                "timestamp": "2026-06-02T10:10:00Z",
+                "kline_data": [{"open": 99.9, "high": 100.2, "low": 99.8, "close": 100.0, "volume": 12.0}],
+                "instrument_id": "X-LINEAR.BYBIT",
+                "bar_type": "X-5-MINUTE-LAST",
+            },
+            {"overall_trend": "mixed", "short_term_trend": "mixed", "rsi": 50.0},
+            current_position={"side": "long", "quantity": 1.0, "avg_px": 99.5, "unrealized_pnl": 0.5},
+        )
+    finally:
+        if prev_mod is not None:
+            sys.modules["deepseek_standalone_mod_exit_now"] = prev_mod
+        else:
+            sys.modules.pop("deepseek_standalone_mod_exit_now", None)
+        if openai_prev is not None:
+            sys.modules["openai"] = openai_prev
+        else:
+            sys.modules.pop("openai", None)
+
+    assert result["signal"] == "HOLD"
+    assert result["position_action"] == "HOLD_POSITION"
+    assert result.get("invalidation_price") is None
+
+
+def test_deepseek_preserves_numeric_invalidation_price():
+    import types
+
+    synth = {
+        "signal": "SELL",
+        "position_action": "ENTER_SHORT",
+        "confidence": "MEDIUM",
+        "regime": "trend_down",
+        "playbook": "TREND_DOWN",
+        "thesis": "Failed bounce below resistance, continuation short remains valid.",
+        "invalidation": "Break above 101.5 invalidates the continuation short.",
+        "invalidation_price": "101.5",
+        "watch_trigger": "Sell failed bounce below 100.8.",
+        "execution_note": "Short continuation probe below failed bounce.",
+        "volume_note": "sell pressure dominant",
+        "risk_assessment": "MEDIUM",
+        "trend_strength": "STRONG",
+        "stop_loss": 101.5,
+        "take_profit": 98.0,
+        "target_r": 1,
+    }
+
+    openai_fake = types.ModuleType("openai")
+    MockOpenAI = Mock()
+    openai_fake.OpenAI = MockOpenAI
+
+    mock_client = MockOpenAI.return_value
+    mock_choice = Mock()
+    mock_choice.message.content = json.dumps(synth)
+    mock_choice.message.reasoning_content = "numeric-invalidation"
+    mock_client.chat.completions.create.return_value = Mock(choices=[mock_choice])
+
+    spec_ds = importlib.util.spec_from_file_location(
+        "deepseek_standalone_mod_invalidation_price", ROOT / "utils" / "deepseek_client.py"
+    )
+    assert spec_ds and spec_ds.loader
+
+    prev_mod = sys.modules.get("deepseek_standalone_mod_invalidation_price")
+    openai_prev = sys.modules.get("openai")
+    try:
+        sys.modules["openai"] = openai_fake
+        ds_mod = importlib.util.module_from_spec(spec_ds)
+        sys.modules["deepseek_standalone_mod_invalidation_price"] = ds_mod
+        spec_ds.loader.exec_module(ds_mod)
+        DeepSeekAnalyzer = ds_mod.DeepSeekAnalyzer
+        client = DeepSeekAnalyzer(
+            api_key="k", model="m", instrument_id="X-LINEAR.BYBIT", bar_type="X-5-MINUTE-LAST"
+        )
+        result = client.analyze(
+            {
+                "price": 100.0,
+                "high": 100.2,
+                "low": 99.8,
+                "volume": 12.0,
+                "price_change": -0.1,
+                "timestamp": "2026-06-02T10:15:00Z",
+                "kline_data": [{"open": 100.1, "high": 100.2, "low": 99.8, "close": 100.0, "volume": 12.0}],
+                "instrument_id": "X-LINEAR.BYBIT",
+                "bar_type": "X-5-MINUTE-LAST",
+            },
+            {"overall_trend": "strong_down", "short_term_trend": "down", "rsi": 34.0},
+            current_position=None,
+        )
+    finally:
+        if prev_mod is not None:
+            sys.modules["deepseek_standalone_mod_invalidation_price"] = prev_mod
+        else:
+            sys.modules.pop("deepseek_standalone_mod_invalidation_price", None)
+        if openai_prev is not None:
+            sys.modules["openai"] = openai_prev
+        else:
+            sys.modules.pop("openai", None)
+
+    assert result["position_action"] == "ENTER_SHORT"
+    assert result["invalidation_price"] == 101.5
 
 
 def test_deepseek_warns_on_non_english_synthesis_but_uses_signal(caplog):
@@ -447,9 +603,266 @@ def test_prompt_framework_reframes_exit_and_mid_range_behavior():
         else:
             sys.modules.pop("openai", None)
 
-    assert "position_action\": \"ENTER_LONG|ENTER_SHORT|HOLD_POSITION|EXIT_NOW|NO_ACTION" in prompt
+    assert "position_action\": \"ENTER_LONG|ENTER_SHORT|HOLD_POSITION|NO_ACTION" in prompt
+    assert "\"invalidation_price\": 0" in prompt
+    assert "\"hold_reason\":" in prompt
+    assert "\"setup_type\":" in prompt
+    assert "\"thesis_state\":" in prompt
+    assert "\"prior_trigger_status\":" in prompt
+    assert "\"watch_trigger_price\":" in prompt
+    assert "\"watch_trigger_direction\":" in prompt
+    assert "\"watch_trigger_expiry_bars\":" in prompt
+    assert "structured fields are authoritative" in prompt
     assert "do not exit because of small giveback alone" in prompt
     assert "Mid-range -> prefer NO_ACTION" in prompt
+    assert "support or oversold RSI alone is not a veto" in prompt
+    assert "NO_ACTION carries burden-of-proof" in prompt
+    assert "hold_reason must name a specific disqualifier" in prompt
+    assert "Flat waits: position_action=NO_ACTION" in prompt
+    assert "In-position intact thesis: position_action=HOLD_POSITION" in prompt
+    assert "prior_trigger_status to FIRED, EXPIRED, or UNFIRED" in prompt
+    assert "do not restate the same wait thesis" in prompt
+    assert "If evidence is mixed or low quality, HOLD (NO_ACTION)" not in prompt
+    assert "HOLD is allowed when evidence conflicts" not in prompt
+
+
+def test_prior_decision_context_includes_levels_and_watch_trigger():
+    import types
+
+    openai_fake = types.ModuleType("openai")
+    MockOpenAI = Mock()
+    openai_fake.OpenAI = MockOpenAI
+
+    spec_ds = importlib.util.spec_from_file_location(
+        "deepseek_standalone_mod_prior_context", ROOT / "utils" / "deepseek_client.py"
+    )
+    assert spec_ds and spec_ds.loader
+
+    prev_mod = sys.modules.get("deepseek_standalone_mod_prior_context")
+    openai_prev = sys.modules.get("openai")
+    try:
+        sys.modules["openai"] = openai_fake
+        ds_mod = importlib.util.module_from_spec(spec_ds)
+        sys.modules["deepseek_standalone_mod_prior_context"] = ds_mod
+        spec_ds.loader.exec_module(ds_mod)
+        text = ds_mod.DeepSeekAnalyzer._format_prior_decision_context(
+            {
+                "signal": "HOLD",
+                "position_action": "NO_ACTION",
+                "confidence": "MEDIUM",
+                "regime": "trend_down",
+                "playbook": "TREND_DOWN",
+                "target_r": 1,
+                "thesis": "Wait for breakdown below 99.8.",
+                "invalidation": "Break above 101.5 invalidates.",
+                "invalidation_price": 101.5,
+                "hold_reason": "No breakdown yet; sub-friction edge.",
+                "setup_type": "breakdown",
+                "thesis_state": "PENDING",
+                "prior_trigger_status": "UNFIRED",
+                "watch_trigger": "Break below 99.8 with sell-heavy flow.",
+                "watch_trigger_price": 99.8,
+                "watch_trigger_direction": "short",
+                "watch_trigger_expiry_bars": 3,
+                "execution_note": "Short continuation probe.",
+                "submitted_entry_price": 100.2,
+                "submitted_stop_loss": 101.5,
+                "submitted_take_profit": 98.7,
+            },
+            3,
+        )
+    finally:
+        if prev_mod is not None:
+            sys.modules["deepseek_standalone_mod_prior_context"] = prev_mod
+        else:
+            sys.modules.pop("deepseek_standalone_mod_prior_context", None)
+        if openai_prev is not None:
+            sys.modules["openai"] = openai_prev
+        else:
+            sys.modules.pop("openai", None)
+
+    assert "playbook=TREND_DOWN" in text
+    assert "prior_invalidation_price=101.5" in text
+    assert "prior_levels entry=100.2 sl=101.5 tp=98.7" in text
+    assert "prior_watch_trigger=Break below 99.8 with sell-heavy flow." in text
+    assert "prior_watch_structured price=99.8 dir=short expiry_bars=3" in text
+    assert "prior_hold_reason=No breakdown yet; sub-friction edge." in text
+    assert "setup_type=breakdown thesis_state=PENDING prior_trigger_status=UNFIRED" in text
+    assert "Adjudicate whether the prior watch trigger fired or expired" in text
+
+
+def test_deepseek_parses_trend_participation_fields():
+    import types
+
+    synth = {
+        "signal": "HOLD",
+        "position_action": "NO_ACTION",
+        "confidence": "MEDIUM",
+        "regime": "trend_down_wait",
+        "playbook": "TREND_DOWN",
+        "setup_type": "failed_bounce",
+        "thesis_state": "PENDING",
+        "thesis": "Trend down intact; wait for breakdown below 99.5.",
+        "hold_reason": "No clean breakdown yet; flow still two-sided.",
+        "invalidation": "Reclaim above 101.0 invalidates short wait.",
+        "invalidation_price": 101.0,
+        "prior_trigger_status": "UNFIRED",
+        "watch_trigger_price": 99.5,
+        "watch_trigger_direction": "down",
+        "watch_trigger_expiry_bars": 4,
+        "watch_trigger": "Optional narrative color only.",
+        "execution_note": "Wait for structured trigger.",
+        "volume_note": "sell pressure building",
+        "risk_assessment": "MEDIUM",
+        "trend_strength": "STRONG",
+    }
+
+    openai_fake = types.ModuleType("openai")
+    MockOpenAI = Mock()
+    openai_fake.OpenAI = MockOpenAI
+
+    mock_client = MockOpenAI.return_value
+    mock_choice = Mock()
+    mock_choice.message.content = json.dumps(synth)
+    mock_choice.message.reasoning_content = "trend-participation-fields"
+    mock_client.chat.completions.create.return_value = Mock(choices=[mock_choice])
+
+    spec_ds = importlib.util.spec_from_file_location(
+        "deepseek_standalone_mod_trend_fields", ROOT / "utils" / "deepseek_client.py"
+    )
+    assert spec_ds and spec_ds.loader
+
+    prev_mod = sys.modules.get("deepseek_standalone_mod_trend_fields")
+    openai_prev = sys.modules.get("openai")
+    try:
+        sys.modules["openai"] = openai_fake
+        ds_mod = importlib.util.module_from_spec(spec_ds)
+        sys.modules["deepseek_standalone_mod_trend_fields"] = ds_mod
+        spec_ds.loader.exec_module(ds_mod)
+        DeepSeekAnalyzer = ds_mod.DeepSeekAnalyzer
+        client = DeepSeekAnalyzer(
+            api_key="k", model="m", instrument_id="X-LINEAR.BYBIT", bar_type="X-5-MINUTE-LAST"
+        )
+        result = client.analyze(
+            {
+                "price": 100.0,
+                "high": 100.2,
+                "low": 99.8,
+                "volume": 12.0,
+                "price_change": -0.2,
+                "timestamp": "2026-06-02T10:20:00Z",
+                "kline_data": [{"open": 100.1, "high": 100.2, "low": 99.8, "close": 100.0, "volume": 12.0}],
+                "instrument_id": "X-LINEAR.BYBIT",
+                "bar_type": "X-5-MINUTE-LAST",
+            },
+            {"overall_trend": "strong_down", "short_term_trend": "down", "rsi": 36.0},
+            current_position=None,
+        )
+    finally:
+        if prev_mod is not None:
+            sys.modules["deepseek_standalone_mod_trend_fields"] = prev_mod
+        else:
+            sys.modules.pop("deepseek_standalone_mod_trend_fields", None)
+        if openai_prev is not None:
+            sys.modules["openai"] = openai_prev
+        else:
+            sys.modules.pop("openai", None)
+
+    assert result["position_action"] == "NO_ACTION"
+    assert result["hold_reason"] == synth["hold_reason"]
+    assert result["setup_type"] == "failed_bounce"
+    assert result["thesis_state"] == "PENDING"
+    assert result["prior_trigger_status"] == "UNFIRED"
+    assert result["watch_trigger_price"] == 99.5
+    assert result["watch_trigger_direction"] == "short"
+    assert result["watch_trigger_expiry_bars"] == 4
+    assert result["watch_trigger"] == synth["watch_trigger"]
+
+
+def test_deepseek_unknown_optional_fields_degrade_safely(caplog):
+    import types
+
+    synth = {
+        "signal": "HOLD",
+        "position_action": "NO_ACTION",
+        "confidence": "LOW",
+        "regime": "range",
+        "playbook": "RANGE",
+        "thesis": "Range mid; wait.",
+        "invalidation": "Breakout either side.",
+        "execution_note": "Wait.",
+        "volume_note": "muted",
+        "risk_assessment": "LOW",
+        "trend_strength": "WEAK",
+        "thesis_state": "MAYBE_LATER",
+        "prior_trigger_status": "STALE",
+        "watch_trigger_price": -1,
+        "watch_trigger_direction": "sideways",
+        "watch_trigger_expiry_bars": 0,
+        "hold_reason": "",
+        "setup_type": "   ",
+    }
+
+    openai_fake = types.ModuleType("openai")
+    MockOpenAI = Mock()
+    openai_fake.OpenAI = MockOpenAI
+
+    mock_client = MockOpenAI.return_value
+    mock_choice = Mock()
+    mock_choice.message.content = json.dumps(synth)
+    mock_choice.message.reasoning_content = "degrade-optional"
+    mock_client.chat.completions.create.return_value = Mock(choices=[mock_choice])
+
+    spec_ds = importlib.util.spec_from_file_location(
+        "deepseek_standalone_mod_degrade", ROOT / "utils" / "deepseek_client.py"
+    )
+    assert spec_ds and spec_ds.loader
+
+    prev_mod = sys.modules.get("deepseek_standalone_mod_degrade")
+    openai_prev = sys.modules.get("openai")
+    try:
+        sys.modules["openai"] = openai_fake
+        ds_mod = importlib.util.module_from_spec(spec_ds)
+        sys.modules["deepseek_standalone_mod_degrade"] = ds_mod
+        spec_ds.loader.exec_module(ds_mod)
+        DeepSeekAnalyzer = ds_mod.DeepSeekAnalyzer
+        client = DeepSeekAnalyzer(
+            api_key="k", model="m", instrument_id="X-LINEAR.BYBIT", bar_type="X-5-MINUTE-LAST"
+        )
+        result = client.analyze(
+            {
+                "price": 100.0,
+                "high": 100.1,
+                "low": 99.9,
+                "volume": 8.0,
+                "price_change": 0.0,
+                "timestamp": "2026-06-02T10:25:00Z",
+                "kline_data": [{"open": 100.0, "high": 100.1, "low": 99.9, "close": 100.0, "volume": 8.0}],
+                "instrument_id": "X-LINEAR.BYBIT",
+                "bar_type": "X-5-MINUTE-LAST",
+            },
+            {"overall_trend": "mixed", "short_term_trend": "mixed", "rsi": 50.0},
+        )
+    finally:
+        if prev_mod is not None:
+            sys.modules["deepseek_standalone_mod_degrade"] = prev_mod
+        else:
+            sys.modules.pop("deepseek_standalone_mod_degrade", None)
+        if openai_prev is not None:
+            sys.modules["openai"] = openai_prev
+        else:
+            sys.modules.pop("openai", None)
+
+    assert result["position_action"] == "NO_ACTION"
+    assert "thesis_state" not in result
+    assert "prior_trigger_status" not in result
+    assert "watch_trigger_price" not in result
+    assert "watch_trigger_direction" not in result
+    assert "watch_trigger_expiry_bars" not in result
+    assert "hold_reason" not in result
+    assert "setup_type" not in result
+    assert any("Invalid thesis_state" in rec.message for rec in caplog.records)
+    assert any("Invalid prior_trigger_status" in rec.message for rec in caplog.records)
 
 
 def test_market_state_prompt_text_uses_new_fields_without_removed_or_none_values():
@@ -603,7 +1016,42 @@ def test_ob_tf_window_summaries_shape():
 
 
 @pytest.mark.skipif(
-    importlib.util.find_spec("nautilus_trader") is None,
+    not _nautilus_trader_available(),
+    reason="nautilus_trader not installed",
+)
+def test_bracket_geometry_helpers_use_dynamic_rr_and_friction():
+    mod = _load_deepseek_strategy_module()
+    DeepSeekAIStrategy = mod.DeepSeekAIStrategy
+
+    strategy = DeepSeekAIStrategy.__new__(DeepSeekAIStrategy)
+    strategy.min_entry_rr = 0.5
+    strategy.latest_price_data = {"microstructure": {"spread_bps": 1.0}}
+
+    assert strategy._required_min_rr_for_risk_pct(0.4) == 0.5
+    assert strategy._required_min_rr_for_risk_pct(0.8) == 0.75
+    assert strategy._required_min_rr_for_risk_pct(1.2) == 1.0
+
+    floor, cap = strategy._stop_risk_bounds(1000.0, 10.0)
+    assert floor == pytest.approx(12.0)
+    assert cap == pytest.approx(20.0)
+
+    net_rr = strategy._net_r_multiple(1000.0, 12.0, 24.0)
+    assert net_rr > 1.0
+
+    spec = strategy._parse_watch_trigger_spec(
+        {
+            "watch_trigger_price": 995.0,
+            "watch_trigger_direction": "down",
+            "watch_trigger_expiry_bars": 5,
+        }
+    )
+    assert spec["price"] == 995.0
+    assert spec["direction"] == "short"
+    assert spec["expiry_bars"] == 5
+
+
+@pytest.mark.skipif(
+    not _nautilus_trader_available(),
     reason="nautilus_trader not installed",
 )
 def test_market_state_gate_skips_unchanged_hold_context():
@@ -648,7 +1096,7 @@ def test_market_state_gate_skips_unchanged_hold_context():
 
 
 @pytest.mark.skipif(
-    importlib.util.find_spec("nautilus_trader") is None,
+    not _nautilus_trader_available(),
     reason="nautilus_trader not installed",
 )
 def test_hold_partial_close_is_noop():
@@ -681,7 +1129,7 @@ def test_hold_partial_close_is_noop():
 
 
 @pytest.mark.skipif(
-    importlib.util.find_spec("nautilus_trader") is None,
+    not _nautilus_trader_available(),
     reason="nautilus_trader not installed",
 )
 def test_stop_loss_calculation_stub():
@@ -705,7 +1153,7 @@ def test_stop_loss_calculation_stub():
 
 
 @pytest.mark.skipif(
-    importlib.util.find_spec("nautilus_trader") is None,
+    not _nautilus_trader_available(),
     reason="nautilus_trader not installed",
 )
 def test_take_profit_scaling_stub():
