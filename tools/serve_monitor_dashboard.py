@@ -44,6 +44,11 @@ RE_POSITION_CLOSED = re.compile(r"🔴 Position closed:\s*(LONG|SHORT)\s*P&L:\s*
 RE_WARMUP = re.compile(r"Received\s+([0-9]+)\s+warmup bars")
 RE_POSITION_NET = re.compile(r"net_position=([+-]?[0-9]+(?:\.[0-9]+)?)")
 RE_POSITION_AVG = re.compile(r"Position avg_px verified .*internal=([0-9]+(?:\.[0-9]+)?)")
+RE_INIT_OPEN_POSITIONS = re.compile(r"Initialized\s+([0-9]+)\s+open positions")
+RE_BYBIT_RISK_CONTEXT = re.compile(
+    r"Bybit Risk Context: .* position=(flat|long|short)\s+([0-9.]+)",
+    re.IGNORECASE,
+)
 RE_LLM_PROMPT_PAYLOAD = re.compile(r"🤖 LLM Prompt Payload:\s*(\{.*\})$")
 RE_LLM_RESPONSE_JSON = re.compile(r"🤖 LLM Response JSON:\s*(\{.*\})$")
 RE_LLM_RAW_RESPONSE = re.compile(r"🤖 DeepSeek Raw Response:\s*(.+)", re.DOTALL)
@@ -499,6 +504,17 @@ def _parse_log_metrics(log_path: Optional[Path], target_pid: Optional[int] = Non
                     last_reconciled_avg_px = float(m_pos_avg.group(1))
                     if position is not None:
                         position.entry_price = last_reconciled_avg_px
+
+                m_init_pos = RE_INIT_OPEN_POSITIONS.search(msg)
+                if m_init_pos and int(m_init_pos.group(1)) == 0:
+                    position = None
+
+                m_risk_ctx = RE_BYBIT_RISK_CONTEXT.search(msg)
+                if m_risk_ctx:
+                    side = m_risk_ctx.group(1).lower()
+                    qty = float(m_risk_ctx.group(2))
+                    if side == "flat" or qty == 0:
+                        position = None
 
                 m_pos_closed = RE_POSITION_CLOSED.search(msg)
                 if m_pos_closed:
